@@ -595,24 +595,58 @@ PRODUK_PATTERNS = [
 ]
 
 
+# ── SKU → nama produk mapping (machine-printed, tidak pernah garbled oleh watermark) ──
+# Urutkan dari yang PALING SPESIFIK dulu (ABLTS sebelum ABLT)
+_SKU_TO_PRODUK = [
+    (r"0208.BLTS",   "Body Lotion Sachet"),
+    (r"0208.BLT",    "Body Lotion"),
+    (r"0310.MLP",    "Lip Serum"),
+    (r"0208.USN",    "Underarm"),
+    (r"0208.GSP",    "Glow Soap"),
+    (r"0208.SRG",    "Serum Glow"),
+    (r"0208.EC",     "Eye Cream"),
+    (r"0208.FS",     "Feminine Spray"),
+    (r"0208.MC",     "Men Care"),
+    (r"0208.SSN",    "Sunscreen"),
+    (r"0208.PS",     "Peeling Serum"),
+    (r"0208.PRF",    "Parfume"),
+    (r"0208.TNR",    "Toner"),
+    (r"0208.BYC",    "Build Your Chapter"),
+    (r"0208.CLD",    "Collagen Drink"),
+    (r"0208.DC",     "Day Cream"),
+    (r"0208.NG",     "Night Gel"),
+    (r"0208.FW",     "Facial Wash"),
+    (r"0208.MLB",    "Meili Beauty Cream"),
+]
+
+
+def _sku_to_produk_name(sku_code: str) -> str | None:
+    """Lookup produk dari SKU code. Returns nama produk atau None."""
+    for pattern, nama in _SKU_TO_PRODUK:
+        if re.search(pattern, sku_code, re.IGNORECASE):
+            return nama
+    return None
+
+
 def _parse_merchant_table(text_clean: str) -> tuple:
     """
-    Dari J&T 2nd print, extract (merchant_title_text, qty) dari Merchant Title table.
+    Dari J&T 2nd print, extract (merchant_title_text, sku_code, qty) dari Merchant Title table.
 
     Format tabel: header 'Merchant Title SKU Qty', lalu baris data:
         [title teks] [SKU_CODE ≥6 char] [qty angka]
 
+    SKU code adalah machine-printed → tidak pernah garbled walau ada COD watermark.
     Catatan: posisi tabel di text bervariasi — bisa SEBELUM atau SESUDAH Order ID/Package ID,
     tergantung layout halaman. Regex tidak pakai end-anchor supaya selalu ketemu.
 
-    Returns: (title_str, qty_int) atau (None, None) kalau tabel tidak ditemukan.
+    Returns: (title_str, sku_code, qty_int) atau (None, None, None) kalau tidak ditemukan.
     """
     merch_m = re.search(
         r"Merchant\s+Title\s+SKU\s+Qty(.+)",
         text_clean, re.DOTALL | re.IGNORECASE
     )
     if not merch_m:
-        return None, None
+        return None, None, None
 
     section = merch_m.group(1)
     for line in section.split("\n"):
@@ -622,9 +656,9 @@ def _parse_merchant_table(text_clean: str) -> tuple:
         # Format baris: [title bebas] [SKU ≥6 alphanum] [qty digit] di akhir baris
         m = re.search(r"^(.+?)\s+\b([A-Z0-9]{6,})\s+(\d+)\s*$", line)
         if m:
-            return m.group(1).strip(), int(m.group(3))   # (title, qty)
+            return m.group(1).strip(), m.group(2).strip(), int(m.group(3))  # (title, sku, qty)
 
-    return None, None
+    return None, None, None
 
 
 def _base_produk(sku_name: str) -> str:
@@ -641,10 +675,19 @@ def parse_produk(text: str) -> dict:
     text_clean = re.sub(r"(?:Pengirim|Sender)\s*[:\(][^\n]*\n?", "", text, flags=re.IGNORECASE)
 
     # ── Baca Merchant Title table (J&T 2nd print) — sumber paling akurat ──
-    # Memberikan (title_text, qty) langsung dari tabel clean di 2nd print.
-    # title_text digunakan JUGA sebagai search text supaya deteksi produk
-    # tidak bergantung pada teks garbled di bagian 1st print (misal "BODY COD LOTION").
-    merch_title, table_qty = _parse_merchant_table(text_clean)
+    # Memberikan (title_text, sku_code, qty) langsung dari tabel di 2nd print.
+    # SKU code adalah machine-printed → TIDAK pernah garbled oleh COD watermark.
+    merch_title, table_sku, table_qty = _parse_merchant_table(text_clean)
+
+    # ── SHORT-CIRCUIT via SKU: jika SKU dikenal → return langsung, skip text matching ──
+    # Ini solusi untuk COD watermark yang garble teks Barang & Merchant Title,
+    # tapi TIDAK pernah garble SKU code (machine-printed).
+    if table_sku:
+        sku_produk = _sku_to_produk_name(table_sku)
+        if sku_produk:
+            qty = table_qty if table_qty else 1
+            key = f"{sku_produk} {qty} PCS" if qty > 1 else sku_produk
+            return {key: 1}
 
     # Untuk pattern matching: gabungkan text_clean + merchant title (kalau ada)
     # → merchant title selalu clean, membantu kalau teks utama garbled/berantakan
