@@ -595,27 +595,36 @@ PRODUK_PATTERNS = [
 ]
 
 
-def _extract_jnt_table_qty(text_clean: str) -> int | None:
+def _parse_merchant_table(text_clean: str) -> tuple:
     """
-    Untuk resi J&T: baca Qty dari tabel 'Merchant Title | SKU | Qty' di 2nd print.
-    Format baris data: [garbled title] [SKU_CODE ≥6 char] [angka] ← Qty ada di akhir baris.
-    Return None kalau tidak ketemu (fallback ke sumber lain).
+    Dari J&T 2nd print, extract (merchant_title_text, qty) dari Merchant Title table.
+
+    Format tabel: header 'Merchant Title SKU Qty', lalu baris data:
+        [title teks] [SKU_CODE ≥6 char] [qty angka]
+
+    Catatan: posisi tabel di text bervariasi — bisa SEBELUM atau SESUDAH Order ID/Package ID,
+    tergantung layout halaman. Regex tidak pakai end-anchor supaya selalu ketemu.
+
+    Returns: (title_str, qty_int) atau (None, None) kalau tabel tidak ditemukan.
     """
     merch_m = re.search(
-        r"Merchant\s+Title\s+SKU\s+Qty(.+?)(?:Order\s+ID|Package\s+ID)",
+        r"Merchant\s+Title\s+SKU\s+Qty(.+)",
         text_clean, re.DOTALL | re.IGNORECASE
     )
     if not merch_m:
-        return None
+        return None, None
+
     section = merch_m.group(1)
     for line in section.split("\n"):
-        if re.search(r"qty\s+total", line, re.IGNORECASE):
-            break
-        # Cari: [SKU ≥6 alphanum] diikuti tepat satu angka di akhir baris
-        m = re.search(r"\b([A-Z0-9]{6,})\s+(\d+)\s*$", line)
+        line = line.strip()
+        if not line or re.search(r"qty\s+total", line, re.IGNORECASE):
+            continue
+        # Format baris: [title bebas] [SKU ≥6 alphanum] [qty digit] di akhir baris
+        m = re.search(r"^(.+?)\s+\b([A-Z0-9]{6,})\s+(\d+)\s*$", line)
         if m:
-            return int(m.group(2))
-    return None
+            return m.group(1).strip(), int(m.group(3))   # (title, qty)
+
+    return None, None
 
 
 def _base_produk(sku_name: str) -> str:
@@ -631,10 +640,17 @@ def parse_produk(text: str) -> dict:
     # (contoh: "Lip serum beauty of angel" di nama pengirim J&T)
     text_clean = re.sub(r"(?:Pengirim|Sender)\s*[:\(][^\n]*\n?", "", text, flags=re.IGNORECASE)
 
-    # ── Baca Qty dari Merchant Title table (J&T 2nd print) — sumber paling akurat ──
-    # Contoh hal 130: "...0208ABLT 2\nQty Total: 1" → table_qty = 2
-    # Contoh hal 6  : "...0208ABLT Qty Tota1l: 1"  → no clean match → table_qty = None
-    table_qty = _extract_jnt_table_qty(text_clean)
+    # ── Baca Merchant Title table (J&T 2nd print) — sumber paling akurat ──
+    # Memberikan (title_text, qty) langsung dari tabel clean di 2nd print.
+    # title_text digunakan JUGA sebagai search text supaya deteksi produk
+    # tidak bergantung pada teks garbled di bagian 1st print (misal "BODY COD LOTION").
+    merch_title, table_qty = _parse_merchant_table(text_clean)
+
+    # Untuk pattern matching: gabungkan text_clean + merchant title (kalau ada)
+    # → merchant title selalu clean, membantu kalau teks utama garbled/berantakan
+    search_text = text_clean
+    if merch_title:
+        search_text = text_clean + "\n" + merch_title
 
     # ── Cek apakah ada field "Barang :" (format J&T) — fallback qty source ──
     barang_m = re.search(r"Barang\s*:\s*(.+?)(?:\n|$)", text_clean, re.IGNORECASE)
@@ -643,7 +659,7 @@ def parse_produk(text: str) -> dict:
     matched_base: set[str] = set()   # untuk exclusive matching: skip parent kalau child sudah match
 
     for pat, nama in PRODUK_PATTERNS:
-        if not re.search(pat, text_clean, re.IGNORECASE):
+        if not re.search(pat, search_text, re.IGNORECASE):
             continue
 
         # ── Exclusive matching: skip jika variant lebih spesifik sudah match ──
@@ -848,22 +864,18 @@ def split_pdf_by_kurir(
                 "is_multi_sku": _is_multi(parse_result),
             })
 
-    # ── PASS 2: Group by (kurir, BASE produk) untuk single-SKU ──
-    # Grouping pakai BASE nama (tanpa qty suffix) supaya variant berbeda tetap bisa merge.
-    # Contoh: "Body Lotion" + "Body Lotion 2 PCS" → sama-sama masuk group "Body Lotion".
-    # Filename pakai qty hanya kalau SEMUA resi dalam group punya key yang identik.
+    # ── PASS 2: Group by (kurir, sku+qty) untuk single-SKU ──
+    # Grouping pakai nama LENGKAP termasuk qty: "Body Lotion" dan "Body Lotion 2 PCS"
+    # masuk grup terpisah supaya admin bisa pack sesuai varian.
     if progress_cb:
         progress_cb(total_pages, total_pages, "Mengelompokkan resi…")
 
-    # Hitung member per (kurir, BASE produk) untuk single-SKU pages
-    sku_count    = defaultdict(int)
-    base_key_set = defaultdict(set)   # (kurir, base) → set of distinct sku_names (for filename logic)
+    # Hitung member per (kurir, sku_name) untuk single-SKU pages
+    sku_count = defaultdict(int)
     for p in pages_info:
         if p["kurir"] and not p["is_multi_sku"] and p["parse_result"]:
-            sku_name  = next(iter(p["parse_result"].keys()))
-            base_name = _base_produk(sku_name)
-            sku_count[(p["kurir"], base_name)] += 1
-            base_key_set[(p["kurir"], base_name)].add(sku_name)
+            sku_name = next(iter(p["parse_result"].keys()))
+            sku_count[(p["kurir"], sku_name)] += 1
 
     # Assign final group key
     groups = defaultdict(lambda: {
@@ -887,17 +899,12 @@ def split_pdf_by_kurir(
             target = f"{_kurir_slug(kurir)}_Multi"
             grp_kurir, grp_produk = kurir, "Mixed (orphan + multi-SKU)"
         else:
-            sku_name  = next(iter(parse_result.keys()))
-            base_name = _base_produk(sku_name)
-            count     = sku_count[(kurir, base_name)]
+            sku_name = next(iter(parse_result.keys()))
+            count    = sku_count[(kurir, sku_name)]
             if count >= 2:
-                # Group ≥2 — PDF sendiri
-                # Filename: pakai sku_name lengkap (dgn qty) kalau group homogen,
-                # pakai base_name kalau ada variant berbeda dalam satu group.
-                distinct = base_key_set[(kurir, base_name)]
-                file_key = sku_name if len(distinct) == 1 else base_name
-                target = f"{_kurir_slug(kurir)}_{_produk_slug(file_key)}"
-                grp_kurir, grp_produk = kurir, file_key
+                # Group ≥2 — PDF sendiri dengan nama lengkap termasuk qty
+                target = f"{_kurir_slug(kurir)}_{_produk_slug(sku_name)}"
+                grp_kurir, grp_produk = kurir, sku_name
             else:
                 # Orphan single-SKU → masuk Multi
                 target = f"{_kurir_slug(kurir)}_Multi"
