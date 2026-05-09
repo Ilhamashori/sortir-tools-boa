@@ -668,21 +668,22 @@ def assign_kloteran(
     Returns list of kloteran dicts:
     {
         "nomor": int,
-        "label": str,           # "1" atau "A" tergantung tanggal
+        "label": str,
         "kurir": str,
         "is_multi": bool,
-        "produk_list": [str],   # list produk (singkat), untuk multi: semua varian
-        "produk_display": str,  # "Body Lotion" / "BL Sachet / Lip Serum"
+        "produk_list": [str],       # list produk singkat
+        "produk_display": str,      # untuk tabel UI
+        "produk_qty": dict,         # {nama_singkat: total_pcs} untuk kartu cetak
         "jumlah_resi": int,
-        "group_key": str,       # key di groups dict
-        "page_indices": [int],  # list halaman asli PDF
+        "total_pcs": int,           # total semua pcs di kloteran ini
+        "group_key": str,
+        "page_indices": [int],
     }
     """
     kloterans = []
     counter   = 1
 
-    # Sort groups: non-multi dulu, lalu multi
-    all_keys = [k for k in sorted(groups.keys()) if not k.startswith("_")]
+    all_keys  = [k for k in sorted(groups.keys()) if not k.startswith("_")]
     non_multi = [k for k in all_keys if not k.endswith("_Multi") and k != KURIR_BELUM_TERDETEKSI]
     multi     = [k for k in all_keys if k.endswith("_Multi")]
     undetect  = [k for k in all_keys if k == KURIR_BELUM_TERDETEKSI]
@@ -697,33 +698,36 @@ def assign_kloteran(
         is_multi = gkey.endswith("_Multi") or gkey == KURIR_BELUM_TERDETEKSI
         batas    = batas_multi if is_multi else batas_single
 
-        # Kumpulkan semua page index dari group ini (sudah di-sort oleh sort_key)
         sorted_pages = sorted(d["pages"], key=lambda x: x[2])
-        all_idx = [idx for idx, _, _ in sorted_pages]
+        all_pages    = [(idx, parse_result) for idx, parse_result, _ in sorted_pages]
 
-        # Ambil produk list untuk display
-        if is_multi:
-            # List semua produk unik yang ada di kloteran ini
-            produk_set = []
-            for _, parse_result, _ in sorted_pages:
-                for p in parse_result:
-                    base = _base_produk(p)
-                    short = _singkat_produk(base)
-                    if short not in produk_set:
-                        produk_set.append(short)
-            produk_list = produk_set
-        else:
-            # Single produk — ambil dari group key
-            produk_name = d.get("produk") or gkey
-            produk_list = [_singkat_produk(produk_name)]
+        # Pecah jadi chunk
+        chunks_pages = [all_pages[i:i+batas] for i in range(0, len(all_pages), batas)]
 
-        # Pecah jadi kloteran sesuai batas
-        chunks = [all_idx[i:i+batas] for i in range(0, len(all_idx), batas)]
+        for chunk in chunks_pages:
+            chunk_idx = [idx for idx, _ in chunk]
 
-        for chunk_idx in chunks:
-            produk_display = " / ".join(produk_list) if is_multi else produk_list[0]
+            # Hitung qty per produk dalam chunk ini
+            # produk_qty: {nama_singkat_dengan_pcs: total_pcs}
+            produk_qty: dict[str, int] = {}
+            for _, parse_result in chunk:
+                for nama, _ in parse_result.items():
+                    short = _singkat_produk(nama)
+                    # qty pcs per item (dari suffix PCS di nama)
+                    m_pcs = re.search(r"(\d+)\s*PCS", nama, re.IGNORECASE)
+                    pcs_per_resi = int(m_pcs.group(1)) if m_pcs else 1
+                    produk_qty[short] = produk_qty.get(short, 0) + pcs_per_resi
+
+            # produk_list: urutan unik produk di chunk ini
+            produk_list = list(produk_qty.keys())
+            total_pcs   = sum(produk_qty.values())
+
+            if is_multi:
+                produk_display = " / ".join(produk_list)
+            else:
+                produk_display = produk_list[0] if produk_list else (d.get("produk") or gkey)
+
             label = _kloteran_label(counter, tanggal)
-
             kloterans.append({
                 "nomor":          counter,
                 "label":          label,
@@ -731,7 +735,9 @@ def assign_kloteran(
                 "is_multi":       is_multi,
                 "produk_list":    produk_list,
                 "produk_display": produk_display,
+                "produk_qty":     produk_qty,
                 "jumlah_resi":    len(chunk_idx),
+                "total_pcs":      total_pcs,
                 "group_key":      gkey,
                 "page_indices":   chunk_idx,
             })
@@ -830,118 +836,239 @@ def build_kloteran_excel(
 #  BUILD KLOTERAN PDF (Print Sheet)
 # ══════════════════════════════════════════════════════════════
 
-def build_kloteran_pdf(
+def _kartu_html(kl: dict, tgl_str: str, nama_toko: str = "BOA PST") -> str:
+    """Render 1 kartu kloteran sebagai HTML — siap digunting."""
+    is_m      = kl["is_multi"]
+    label     = kl["label"]
+    kurir     = kl["kurir"]
+    jml_resi  = kl["jumlah_resi"]
+    produk_qty: dict = kl.get("produk_qty", {})
+
+    # Baris produk: "Lip Serum 2pcs" → "Lip Serum 2pcs · 24 pcs"
+    # Untuk kartu: tampilkan setiap produk + total pcsnya
+    produk_lines = []
+    for p_short, total_p in produk_qty.items():
+        produk_lines.append(f"{p_short} &nbsp;·&nbsp; <b>{total_p} pcs</b>")
+
+    produk_html = "<br/>".join(produk_lines) if produk_lines else "—"
+
+    # Badge tipe
+    if is_m:
+        tipe_html = '<span style="background:#C49166;color:#15110D;padding:1px 6px;border-radius:999px;font-size:8px;font-weight:700;">MULTI</span>'
+    else:
+        tipe_html = '<span style="background:#2E251E;color:#C9B89F;padding:1px 6px;border-radius:999px;font-size:8px;">SINGLE</span>'
+
+    total_pcs = kl.get("total_pcs", sum(produk_qty.values()))
+
+    return f"""
+<div class="kartu">
+  <div class="kartu-top">
+    <div class="toko-tgl">
+      <span class="toko">{nama_toko}</span>
+      <span class="tgl">{tgl_str}</span>
+    </div>
+    {tipe_html}
+  </div>
+  <div class="kloteran-num">{label}</div>
+  <div class="kurir-row">{kurir}</div>
+  <div class="produk-row">{produk_html}</div>
+  <div class="resi-row">
+    <span>{jml_resi} resi</span>
+    <span class="pcs-total">{total_pcs} pcs total</span>
+  </div>
+  <div class="paraf-row">Paraf: ___________</div>
+</div>"""
+
+
+def build_kloteran_print_sheet(
     kloterans: list[dict],
     tanggal: datetime,
     nama_admin: str,
-) -> bytes:
+    nama_toko: str = "BOA PST",
+) -> tuple:
     """
-    Build print sheet HTML → convert ke PDF pakai WeasyPrint.
-    Fallback: return HTML bytes kalau WeasyPrint tidak tersedia.
-    1 halaman A4, semua kloteran dalam 1 tabel bersih.
+    Build print sheet grid kartu A4 — 2 kolom, semua kloteran 1 halaman.
+    Admin tinggal gunting per kartu, tempel ke tumpukan resi.
+    Returns (bytes, "pdf"|"html")
     """
-    tgl_str = tanggal.strftime("%d %B %Y")
+    tgl_str  = tanggal.strftime("%d/%m/%Y")
+    kartu_html_list = [_kartu_html(kl, tgl_str, nama_toko) for kl in kloterans]
+    kartu_joined    = "\n".join(kartu_html_list)
 
-    rows_html = ""
-    for kl in kloterans:
-        is_m = kl["is_multi"]
-        tipe_badge = (
-            '<span style="background:#D4A574;color:#15110D;padding:2px 7px;'
-            'border-radius:999px;font-size:9px;font-weight:700;">MULTI</span>'
-            if is_m else
-            '<span style="background:#3A2F26;color:#C9B89F;padding:2px 7px;'
-            'border-radius:999px;font-size:9px;">SINGLE</span>'
-        )
-        produk_html = kl["produk_display"].replace(" / ", "<br/>") if is_m else kl["produk_display"]
-        row_bg = "#1e1a16" if is_m else "#15110D"
-        rows_html += f"""
-        <tr style="background:{row_bg};">
-            <td style="text-align:center;font-weight:700;font-size:15px;color:#C49166;">{kl['label']}</td>
-            <td style="text-align:center;color:#F0E4D2;">{kl['kurir']}</td>
-            <td style="color:{'#D4A574' if is_m else '#F0E4D2'};line-height:1.5;">{produk_html}</td>
-            <td style="text-align:center;font-weight:700;font-size:14px;color:#F0E4D2;">{kl['jumlah_resi']}</td>
-            <td style="text-align:center;">{tipe_badge}</td>
-            <td style="color:#6B5D4D;font-size:10px;"></td>
-        </tr>"""
+    total_resi   = sum(k["jumlah_resi"] for k in kloterans)
+    total_single = sum(1 for k in kloterans if not k["is_multi"])
+    total_multi  = sum(1 for k in kloterans if k["is_multi"])
 
     html = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8"/>
 <style>
-  @page {{ size: A4; margin: 14mm 12mm; }}
+  @page {{ size: A4 portrait; margin: 8mm 8mm; }}
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ background: #15110D; color: #F0E4D2;
-          font-family: 'Segoe UI', Arial, sans-serif; font-size: 11px; }}
-  .header {{ display:flex; justify-content:space-between; align-items:flex-end;
-             border-bottom: 1.5px solid #C49166; padding-bottom: 8px; margin-bottom: 12px; }}
-  .header-left h1 {{ font-size: 16px; font-weight: 700; color: #C49166; }}
-  .header-left p  {{ font-size: 10px; color: #8A7A66; margin-top: 2px; }}
-  .header-right   {{ font-size: 10px; color: #8A7A66; text-align: right; line-height: 1.6; }}
-  table {{ width: 100%; border-collapse: collapse; }}
-  thead tr {{ background: #C49166; }}
-  thead th {{ padding: 7px 8px; color: #15110D; font-weight: 700; font-size: 10px;
-              text-align: center; letter-spacing: .3px; }}
-  tbody tr {{ border-bottom: 0.5px solid #2E251E; }}
-  tbody td {{ padding: 7px 8px; vertical-align: middle; font-size: 10px; }}
-  .footer {{ margin-top: 12px; display:flex; justify-content:space-between;
-             font-size: 9px; color: #4A3A2C; border-top: 0.5px solid #2E251E; padding-top: 6px; }}
-  .summary {{ margin-bottom: 10px; display:flex; gap: 16px; }}
-  .badge {{ background: #1F1815; border: 0.5px solid #2E251E; border-radius: 8px;
-            padding: 5px 12px; }}
-  .badge span {{ display:block; font-size: 9px; color: #8A7A66; }}
-  .badge strong {{ font-size: 14px; color: #C49166; }}
+  body {{
+    background: #fff;
+    font-family: 'Segoe UI', Arial, sans-serif;
+    font-size: 10px;
+    color: #15110D;
+  }}
+
+  /* ── Page header ── */
+  .page-header {{
+    display: flex; justify-content: space-between; align-items: center;
+    border-bottom: 2px solid #C49166; padding-bottom: 5px; margin-bottom: 8px;
+  }}
+  .page-header h1 {{ font-size: 13px; font-weight: 700; color: #15110D; }}
+  .page-header .meta {{ font-size: 9px; color: #6B5D4D; text-align: right; line-height: 1.6; }}
+  .summary-chips {{ display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }}
+  .chip {{
+    background: #F5EFE6; border: 0.5px solid #C49166;
+    border-radius: 999px; padding: 2px 9px;
+    font-size: 9px; color: #15110D;
+  }}
+  .chip b {{ color: #A8744E; }}
+
+  /* ── Grid kartu ── */
+  .grid {{
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+  }}
+
+  /* ── Kartu ── */
+  .kartu {{
+    border: 1.5px solid #C49166;
+    border-radius: 8px;
+    padding: 7px 9px;
+    background: #fff;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }}
+  .kartu-top {{
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 3px;
+  }}
+  .toko-tgl {{ display: flex; gap: 6px; align-items: center; }}
+  .toko {{ font-weight: 700; font-size: 9px; color: #A8744E; }}
+  .tgl  {{ font-size: 8px; color: #8A7A66; }}
+
+  .kloteran-num {{
+    font-size: 26px; font-weight: 900; color: #C49166;
+    line-height: 1; margin: 2px 0 3px 0; letter-spacing: -0.5px;
+  }}
+
+  .kurir-row {{
+    font-size: 10px; font-weight: 700; color: #15110D;
+    background: #F5EFE6; border-radius: 4px;
+    padding: 2px 6px; display: inline-block;
+    margin-bottom: 4px;
+  }}
+
+  .produk-row {{
+    font-size: 9.5px; color: #2E1A0E; line-height: 1.6;
+    border-top: 0.5px dashed #D4B896; padding-top: 3px; margin-bottom: 3px;
+  }}
+  .produk-row b {{ color: #A8744E; }}
+
+  .resi-row {{
+    display: flex; justify-content: space-between;
+    font-size: 9px; color: #6B5D4D;
+    border-top: 0.5px solid #EDE0D0; padding-top: 3px; margin-bottom: 3px;
+  }}
+  .pcs-total {{ font-weight: 700; color: #15110D; }}
+
+  .paraf-row {{
+    font-size: 8px; color: #B8A78D;
+    border-top: 0.5px dashed #EDE0D0; padding-top: 3px;
+  }}
+
+  /* ── Footer ── */
+  .page-footer {{
+    margin-top: 8px; font-size: 8px; color: #B8A78D;
+    border-top: 0.5px solid #EDE0D0; padding-top: 4px;
+    display: flex; justify-content: space-between;
+  }}
 </style>
 </head>
 <body>
-<div class="header">
-  <div class="header-left">
-    <h1>📋 Rekap Kloteran — BOA Sortir</h1>
-    <p>Tanggal: {tgl_str} &nbsp;·&nbsp; Admin: {nama_admin}</p>
+
+<div class="page-header">
+  <div>
+    <h1>Rekap Kloteran — {nama_toko}</h1>
+    <div style="font-size:9px;color:#8A7A66;">Admin: {nama_admin} &nbsp;·&nbsp; {tanggal.strftime('%d %B %Y')}</div>
   </div>
-  <div class="header-right">
-    Beauty of Angel<br/>
+  <div class="meta">
+    BOA Sortir Tools<br/>
     Print: {datetime.now().strftime('%H:%M')} WIB
   </div>
 </div>
 
-<div class="summary">
-  <div class="badge"><span>Total Kloteran</span><strong>{len(kloterans)}</strong></div>
-  <div class="badge"><span>Total Resi</span><strong>{sum(k['jumlah_resi'] for k in kloterans)}</strong></div>
-  <div class="badge"><span>Single</span><strong>{sum(1 for k in kloterans if not k['is_multi'])}</strong></div>
-  <div class="badge"><span>Multi</span><strong>{sum(1 for k in kloterans if k['is_multi'])}</strong></div>
+<div class="summary-chips">
+  <div class="chip">Total Kloteran <b>{len(kloterans)}</b></div>
+  <div class="chip">Total Resi <b>{total_resi}</b></div>
+  <div class="chip">Single <b>{total_single}</b></div>
+  <div class="chip">Multi <b>{total_multi}</b></div>
 </div>
 
-<table>
-  <thead>
-    <tr>
-      <th style="width:9%">Kloteran</th>
-      <th style="width:14%">Kurir</th>
-      <th style="width:32%">Produk</th>
-      <th style="width:11%">Jml Resi</th>
-      <th style="width:10%">Tipe</th>
-      <th style="width:24%">Paraf / Catatan</th>
-    </tr>
-  </thead>
-  <tbody>
-    {rows_html}
-  </tbody>
-</table>
-
-<div class="footer">
-  <span>BOA Sortir Tools v1.1 — Crafted by Mashori</span>
-  <span>Dokumen internal — tidak untuk disebarkan</span>
+<div class="grid">
+{kartu_joined}
 </div>
+
+<div class="page-footer">
+  <span>BOA Sortir Tools v1.2 — Crafted by Mashori</span>
+  <span>Dokumen internal — potong per kotak, tempel ke tumpukan resi</span>
+</div>
+
 </body>
 </html>"""
 
-    # Try WeasyPrint first, fallback to returning HTML
     try:
         from weasyprint import HTML as WP_HTML
         pdf_bytes = WP_HTML(string=html).write_pdf()
         return pdf_bytes, "pdf"
     except Exception:
         return html.encode("utf-8"), "html"
+
+
+# Alias untuk backward compat dengan tombol lama
+def build_kloteran_pdf(kloterans, tanggal, nama_admin):
+    return build_kloteran_print_sheet(kloterans, tanggal, nama_admin)
+
+
+# ══════════════════════════════════════════════════════════════
+#  BUILD ZIP PDF RESI PER KLOTERAN
+# ══════════════════════════════════════════════════════════════
+
+def build_kloteran_zip_pdf(
+    pdf_bytes: bytes,
+    kloterans: list[dict],
+) -> bytes:
+    """
+    Buat ZIP berisi PDF resi asli yang dipotong per kloteran.
+    Nama file: Kloteran_{label}_{kurir}_{produk_slug}.pdf
+    """
+    from pypdf import PdfReader, PdfWriter
+    pdf_bytes = _repair_pdf(pdf_bytes)
+    reader    = PdfReader(io.BytesIO(pdf_bytes))
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for kl in kloterans:
+            writer = PdfWriter()
+            for idx in kl["page_indices"]:
+                if idx < len(reader.pages):
+                    writer.add_page(reader.pages[idx])
+
+            pdf_buf = io.BytesIO()
+            writer.write(pdf_buf)
+
+            # Nama file
+            kurir_slug  = re.sub(r"[^\w]", "", kl["kurir"].replace("&", ""))
+            produk_slug = re.sub(r"[^\w]", "_", kl["produk_display"])[:30]
+            fname       = f"Kloteran_{kl['label']}_{kurir_slug}_{produk_slug}.pdf"
+            zf.writestr(fname, pdf_buf.getvalue())
+
+    return buf.getvalue()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1378,10 +1505,9 @@ with tab_kloteran:
         st.info("⬅️ Jalankan sortir dulu di tab **📤 Sortir Resi**, lalu kembali ke sini.")
         st.stop()
 
-    # Settings dari sidebar
-    tgl_dt       = datetime.combine(tgl_kloteran, datetime.min.time())
-    tgl_display  = tgl_dt.strftime("%d %B %Y")
-    hari_parity  = "Ganjil → 1,2,3" if tgl_dt.day % 2 == 1 else "Genap → A,B,C"
+    tgl_dt      = datetime.combine(tgl_kloteran, datetime.min.time())
+    tgl_display = tgl_dt.strftime("%d %B %Y")
+    hari_parity = "Ganjil → 1,2,3" if tgl_dt.day % 2 == 1 else "Genap → A,B,C"
 
     st.caption(
         f"Tanggal: **{tgl_display}** · Admin: **{nama_admin}** · "
@@ -1389,39 +1515,43 @@ with tab_kloteran:
         f"Batas single: **{batas_single} resi** · Batas multi: **{batas_multi} resi**"
     )
 
-    # Auto-assign kloteran
     kloterans = assign_kloteran(
-        groups,
-        tanggal=tgl_dt,
-        batas_single=batas_single,
-        batas_multi=batas_multi,
+        groups, tanggal=tgl_dt,
+        batas_single=batas_single, batas_multi=batas_multi,
     )
 
     if not kloterans:
         st.warning("Tidak ada data kloteran. Pastikan sortir sudah dijalankan.")
         st.stop()
 
-    # ── Preview tabel interaktif ──
-    st.markdown(f"**Total: {len(kloterans)} kloteran · {sum(k['jumlah_resi'] for k in kloterans)} resi**")
+    # ── Summary chips ──
+    total_resi_kl = sum(k["jumlah_resi"] for k in kloterans)
+    total_pcs_kl  = sum(k.get("total_pcs", 0) for k in kloterans)
+    col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+    col_s1.metric("Total Kloteran", len(kloterans))
+    col_s2.metric("Total Resi", total_resi_kl)
+    col_s3.metric("Single", sum(1 for k in kloterans if not k["is_multi"]))
+    col_s4.metric("Multi", sum(1 for k in kloterans if k["is_multi"]))
 
-    # Edit table — user bisa adjust produk/kurir kalau mau
+    # ── Tabel preview ──
     df_kl = pd.DataFrame([{
-        "Kloteran":    kl["label"],
-        "Kurir":       kl["kurir"],
-        "Produk":      kl["produk_display"],
-        "Jml Resi":    kl["jumlah_resi"],
-        "Tipe":        "Multi" if kl["is_multi"] else "Single",
+        "Kloteran":  kl["label"],
+        "Kurir":     kl["kurir"],
+        "Produk":    kl["produk_display"],
+        "Jml Resi":  kl["jumlah_resi"],
+        "Total PCS": kl.get("total_pcs", "—"),
+        "Tipe":      "Multi" if kl["is_multi"] else "Single",
     } for kl in kloterans])
-
     st.dataframe(df_kl, hide_index=True, use_container_width=True)
 
     st.divider()
+    st.markdown("##### 📥 Download Output")
 
-    # ── Generate output ──
+    # ── Row 1: Excel + Print Sheet ──
     col_e, col_p = st.columns(2)
 
     with col_e:
-        if st.button("📊 Generate Excel Kloteran", use_container_width=True, key="btn_kl_excel"):
+        if st.button("📊 Excel Kloteran", use_container_width=True, key="btn_kl_excel"):
             with st.spinner("Membuat Excel kloteran…"):
                 try:
                     xl_bytes = build_kloteran_excel(kloterans, tgl_dt, nama_admin)
@@ -1439,20 +1569,22 @@ with tab_kloteran:
                     st.error(f"❌ Gagal buat Excel: {ex}")
 
     with col_p:
-        if st.button("🖨️ Generate Print Sheet", use_container_width=True, key="btn_kl_pdf"):
-            with st.spinner("Membuat print sheet…"):
+        if st.button("🖨️ Print Sheet (Kartu Gunting)", use_container_width=True, key="btn_kl_pdf"):
+            with st.spinner("Membuat print sheet kartu…"):
                 try:
-                    out_bytes, out_type = build_kloteran_pdf(kloterans, tgl_dt, nama_admin)
+                    out_bytes, out_type = build_kloteran_print_sheet(
+                        kloterans, tgl_dt, nama_admin
+                    )
                     if out_type == "pdf":
-                        fname = f"kloteran_{tgl_dt.strftime('%Y%m%d')}_{nama_admin}.pdf"
+                        fname = f"printsheet_{tgl_dt.strftime('%Y%m%d')}_{nama_admin}.pdf"
                         mime  = "application/pdf"
-                        label = f"⬇️ Download {fname}"
+                        btn_label = f"⬇️ Download {fname}"
                     else:
-                        fname = f"kloteran_{tgl_dt.strftime('%Y%m%d')}_{nama_admin}.html"
+                        fname = f"printsheet_{tgl_dt.strftime('%Y%m%d')}_{nama_admin}.html"
                         mime  = "text/html"
-                        label = "⬇️ Download Print Sheet (HTML — buka lalu Ctrl+P)"
+                        btn_label = "⬇️ Download Print Sheet (HTML)"
                     st.download_button(
-                        label=label,
+                        label=btn_label,
                         data=out_bytes,
                         file_name=fname,
                         mime=mime,
@@ -1462,23 +1594,56 @@ with tab_kloteran:
                     )
                     if out_type == "html":
                         st.caption(
-                            "ℹ️ WeasyPrint tidak terpasang — download HTML, "
-                            "buka di browser, lalu Ctrl+P untuk print/save PDF."
+                            "ℹ️ WeasyPrint belum terpasang — buka HTML di browser "
+                            "lalu Ctrl+P → Save as PDF → gunting per kartu."
                         )
                 except Exception as ex:
                     st.error(f"❌ Gagal buat print sheet: {ex}")
 
+    # ── Row 2: PDF resi per kloteran ──
+    st.markdown("")
+    if st.button(
+        "📦 PDF Resi per Kloteran (ZIP)",
+        use_container_width=True,
+        key="btn_kl_zip",
+        help="Buat ZIP berisi PDF resi asli yang sudah dipotong sesuai kloteran. "
+             "Tiap file = 1 kloteran, packer tinggal buka PDF-nya.",
+    ):
+        if pdf_bytes is None:
+            st.error("❌ PDF resi asli tidak ditemukan. Upload ulang di tab Sortir Resi.")
+        else:
+            with st.spinner("Memotong PDF resi per kloteran…"):
+                try:
+                    zip_kl = build_kloteran_zip_pdf(pdf_bytes, kloterans)
+                    fname  = f"resi_kloteran_{tgl_dt.strftime('%Y%m%d')}_{nama_admin}.zip"
+                    st.download_button(
+                        label=f"⬇️ Download {fname}",
+                        data=zip_kl,
+                        file_name=fname,
+                        mime="application/zip",
+                        type="primary",
+                        use_container_width=True,
+                        key="dl_kl_zip",
+                    )
+                    st.caption(
+                        f"ZIP berisi {len(kloterans)} file PDF — "
+                        "nama file: Kloteran_{{label}}_{{kurir}}_{{produk}}.pdf"
+                    )
+                except Exception as ex:
+                    st.error(f"❌ Gagal buat ZIP: {ex}")
+
     st.divider()
 
-    # ── Detail kloteran expand ──
+    # ── Detail expand ──
     with st.expander("🔍 Detail per kloteran"):
         for kl in kloterans:
-            is_m    = kl["is_multi"]
-            tipe    = "Multi" if is_m else "Single"
-            produk  = kl["produk_display"]
+            is_m   = kl["is_multi"]
+            tipe   = "Multi" if is_m else "Single"
+            pq     = kl.get("produk_qty", {})
+            pq_str = "  ·  ".join(f"{p}: {n} pcs" for p, n in pq.items())
             st.markdown(
                 f"**Kloteran {kl['label']}** — {kl['kurir']} — {tipe} — "
                 f"{kl['jumlah_resi']} resi\n\n"
-                f"> Produk: {produk}"
+                f"> {pq_str if pq_str else kl['produk_display']}"
             )
             st.markdown("---")
