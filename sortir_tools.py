@@ -5,6 +5,7 @@
 # ============================================================
 #
 #  Upload PDF resi acak → output ZIP (PDF per kurir, tersortir SKU+qty)
+#  + Fitur Kloteran: auto-assign batch per produk/kurir
 #  Tidak bergantung app.py — standalone dengan login sendiri.
 # ============================================================
 
@@ -17,6 +18,7 @@ import json
 import zipfile
 from datetime import datetime, timedelta
 from collections import defaultdict
+import math
 
 # ══════════════════════════════════════════════════════════════
 #  CONFIG
@@ -39,125 +41,63 @@ header    {visibility: hidden;}
 
 # ══════════════════════════════════════════════════════════════
 #  GLOBAL THEME — Warm Natural Dark
-#  Palette: warm charcoal bg, sand/amber accent, cream text
 # ══════════════════════════════════════════════════════════════
 
 st.markdown("""
 <style>
-/* Base background — warm near-black */
 .stApp { background: #15110D !important; color: #F0E4D2 !important; }
 .stApp > div { background: #15110D !important; }
-
-/* Headings */
 h1, h2, h3, h4, h5, h6 { color: #F0E4D2 !important; }
 p, span, label, div { color: #E8DCC9; }
-
-/* Sidebar */
 section[data-testid="stSidebar"] { background: #1A1411 !important; }
-
-/* Buttons */
 div[data-testid="stButton"] button {
-    background: #C49166 !important;
-    color: #15110D !important;
-    border: none !important;
-    border-radius: 8px !important;
-    font-weight: 600 !important;
-    transition: background 0.15s ease;
+    background: #C49166 !important; color: #15110D !important;
+    border: none !important; border-radius: 8px !important;
+    font-weight: 600 !important; transition: background 0.15s ease;
 }
-div[data-testid="stButton"] button:hover {
-    background: #D4A574 !important;
-}
-div[data-testid="stButton"] button[kind="primary"] {
-    background: #C49166 !important;
-    color: #15110D !important;
-}
+div[data-testid="stButton"] button:hover { background: #D4A574 !important; }
 div[data-testid="stButton"] button[kind="secondary"] {
-    background: #2E251E !important;
-    color: #F0E4D2 !important;
+    background: #2E251E !important; color: #F0E4D2 !important;
     border: 0.5px solid #4A3A2C !important;
 }
-
-/* Inputs */
 div[data-testid="stTextInput"] label,
 div[data-testid="stFileUploader"] label,
-.stCheckbox label p {
-    color: #C9B89F !important;
-    font-weight: 500 !important;
-}
+.stCheckbox label p { color: #C9B89F !important; font-weight: 500 !important; }
 div[data-testid="stTextInput"] input {
-    background: #1F1815 !important;
-    border: 0.5px solid #3A2F26 !important;
-    border-radius: 8px !important;
-    color: #F0E4D2 !important;
-    font-size: 14px !important;
+    background: #1F1815 !important; border: 0.5px solid #3A2F26 !important;
+    border-radius: 8px !important; color: #F0E4D2 !important; font-size: 14px !important;
 }
 div[data-testid="stTextInput"] input::placeholder { color: #6B5D4D !important; }
 div[data-testid="stTextInput"] input:focus {
     border-color: #C49166 !important;
     box-shadow: 0 0 0 2px rgba(196,145,102,0.25) !important;
 }
-
-/* File uploader */
 [data-testid="stFileUploader"] section {
-    background: #1F1815 !important;
-    border: 1px dashed #3A2F26 !important;
+    background: #1F1815 !important; border: 1px dashed #3A2F26 !important;
     border-radius: 10px !important;
 }
-[data-testid="stFileUploader"] section button {
-    background: #C49166 !important;
-    color: #15110D !important;
-}
-
-/* Download button */
+[data-testid="stFileUploader"] section button { background: #C49166 !important; color: #15110D !important; }
 div[data-testid="stDownloadButton"] button {
-    background: #C49166 !important;
-    color: #15110D !important;
-    border-radius: 8px !important;
-    font-weight: 600 !important;
+    background: #C49166 !important; color: #15110D !important;
+    border-radius: 8px !important; font-weight: 600 !important;
 }
-div[data-testid="stDownloadButton"] button:hover {
-    background: #D4A574 !important;
-}
-
-/* Progress bar */
+div[data-testid="stDownloadButton"] button:hover { background: #D4A574 !important; }
 .stProgress > div > div > div > div { background-color: #C49166 !important; }
 .stProgress > div > div > div { background-color: #2E251E !important; }
-
-/* Alerts */
 div[data-testid="stAlert"] {
-    background: #2A1A12 !important;
-    border: 0.5px solid #4A2818 !important;
-    color: #E8B89F !important;
-    border-radius: 8px !important;
+    background: #2A1A12 !important; border: 0.5px solid #4A2818 !important;
+    color: #E8B89F !important; border-radius: 8px !important;
 }
-div[data-baseweb="notification"] {
-    background: #2A1A12 !important;
-    color: #E8B89F !important;
-}
-
-/* DataFrame */
+div[data-baseweb="notification"] { background: #2A1A12 !important; color: #E8B89F !important; }
 .stDataFrame { background: #1A1411 !important; border-radius: 8px; }
-
-/* Divider */
 hr { border-color: #3A2F26 !important; }
-
-/* Caption */
 [data-testid="stCaptionContainer"], small { color: #8A7A66 !important; }
-
-/* Checkbox */
 .stCheckbox [role="checkbox"][aria-checked="true"] {
-    background-color: #C49166 !important;
-    border-color: #C49166 !important;
+    background-color: #C49166 !important; border-color: #C49166 !important;
 }
-
-/* Expander */
 .streamlit-expanderHeader {
-    background: #1F1815 !important;
-    color: #F0E4D2 !important;
-    border-radius: 8px !important;
+    background: #1F1815 !important; color: #F0E4D2 !important; border-radius: 8px !important;
 }
-
-/* Spinner */
 .stSpinner > div { border-top-color: #C49166 !important; }
 </style>
 """, unsafe_allow_html=True)
@@ -194,7 +134,6 @@ def _logout():
         st.session_state.pop(k, None)
 
 if not st.session_state.get("logged_in"):
-    # Responsive: stack di mobile
     st.markdown("""
     <style>
         @media (max-width: 640px) {
@@ -235,7 +174,7 @@ if not st.session_state.get("logged_in"):
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:1.25rem;">
                 <div style="background:#15110D;border:0.5px solid #2E251E;border-radius:8px;padding:10px 12px;">
                     <div style="font-size:10px;color:#D4A574;text-transform:uppercase;letter-spacing:.5px;">Versi</div>
-                    <div style="font-size:16px;font-weight:600;color:#F0E4D2;margin-top:2px;">v1.0</div>
+                    <div style="font-size:16px;font-weight:600;color:#F0E4D2;margin-top:2px;">v1.1</div>
                 </div>
                 <div style="background:#15110D;border:0.5px solid #2E251E;border-radius:8px;padding:10px 12px;">
                     <div style="font-size:10px;color:#D4A574;text-transform:uppercase;letter-spacing:.5px;">Status</div>
@@ -277,7 +216,6 @@ if not st.session_state.get("logged_in"):
         </div>
         """, unsafe_allow_html=True)
 
-    # ── Subtle credit footer (clickable, popup kontak) ──
     st.markdown("""
     <div style="margin-top:14px;text-align:center;font-size:10px;color:#6B5D4D;
                 letter-spacing:0.2px;">
@@ -311,136 +249,35 @@ if not st.session_state.get("logged_in"):
 # ══════════════════════════════════════════════════════════════
 
 KURIR_RULES = [
-    {
-        "kurir": "SPX",
-        "patterns": [
-            r"\bspxid\d{6,}\b",
-            r"shopee\s*express",
-            r"\bspx\b",
-        ],
-        "priority": 10,
-    },
-    {
-        "kurir": "SiCepat",
-        "patterns": [
-            r"\bsicepat\b",
-            r"\bsi\s*cepat\b",
-            r"\bsicep[a-z/]{0,3}t?\b",
-            r"\bhalu\s*5\b",
-            r"\bhalu\s*ribu\b",
-            r"halu.{0,3}5.{0,3}ribu",
-            r"\bribu\b",
-            r"\b0046\d{8}\b",
-        ],
-        "priority": 9,
-    },
-    {
-        "kurir": "JNT LEX",
-        "patterns": [r"\bjnt\s*lex\b", r"\bJNTLEX\d+\b"],
-        "priority": 10,  # lebih tinggi dari J&T biasa
-    },
-    {
-        "kurir": "J&T",
-        "patterns": [
-            r"\bj\s*&\s*t\b",
-            r"\bjnt\s*express\b",
-            r"\bjnt\b",
-            r"\bjet\.co\.id\b",
-            r"\b(?:JX|JT|JP)\d{8,}\b",
-        ],
-        "priority": 9,
-    },
-    {
-        "kurir": "JNE LEX",
-        "patterns": [r"\bjne\s*lex\b", r"\bjnex\b"],
-        "priority": 10,
-    },
-    {
-        "kurir": "JNE",
-        "patterns": [
-            r"\bjne\s*(?:express|reg|yes|oke|trucking)?\b",
-        ],
-        "priority": 9,
-    },
-    {
-        "kurir": "Anteraja",
-        "patterns": [
-            r"\banteraja\b",
-            r"\bantar\s*aja\b",
-            r"pakeko\s*aja",          # sub-brand Anteraja PakEkoAja
-            r"\bpakeko\b",
-            r"\bPLBX?\d*\b",          # service code PLBX9, PLB
-            r"\bTSA-\d{6,}\b",        # resi format TSA-XXXXXXXXX
-        ],
-        "priority": 9,
-    },
-    {
-        "kurir": "GTL",
-        "patterns": [
-            r"\bgtl\b",
-            r"goto\s*logistics",
-        ],
-        "priority": 9,
-    },
-    {
-        "kurir": "Ninja Xpress",
-        "patterns": [
-            r"\bninja\s*xpress\b",
-            r"\bninjaxpress\b",
-            r"\blnid\d+\b",
-        ],
-        "priority": 9,
-    },
-    {
-        "kurir": "Ninja LEX",
-        "patterns": [r"\bninja\s*lex\b", r"\bnlex\b"],
-        "priority": 10,
-    },
-    {
-        "kurir": "SAP",
-        "patterns": [r"\bsap\s*express\b", r"\bsap\b"],
-        "priority": 8,
-    },
-    {
-        "kurir": "SAP LEX",
-        "patterns": [r"\bsap\s*lex\b"],
-        "priority": 10,
-    },
-    {
-        "kurir": "Ninja Pusat",
-        "patterns": [r"\bninja\s*pusat\b", r"\bninjapusat\b"],
-        "priority": 10,
-    },
-    {
-        "kurir": "ID Express",
-        "patterns": [r"\bid\s*express\b", r"\bidexpress\b", r"\bidexp\b"],
-        "priority": 9,
-    },
-    {
-        "kurir": "Pos Indonesia",
-        "patterns": [r"\bpos\s*indonesia\b", r"\bpt\s*pos\b", r"\bpos\b"],
-        "priority": 8,
-    },
-    {
-        "kurir": "Lion Parcel",
-        "patterns": [r"\blion\s*parcel\b", r"\blionparcel\b", r"\blion\b"],
-        "priority": 8,
-    },
-    {
-        "kurir": "Instan",
-        "patterns": [r"\binstan\b", r"\bsameday\b", r"\bsame\s*day\b", r"\binstant\b"],
-        "priority": 9,
-    },
-    {
-        "kurir": "Sentral Cargo",
-        "patterns": [r"\bsentral\s*cargo\b", r"\bsentral\b"],
-        "priority": 9,
-    },
+    {"kurir": "SPX", "patterns": [r"\bspxid\d{6,}\b", r"shopee\s*express", r"\bspx\b"], "priority": 10},
+    {"kurir": "SiCepat", "patterns": [
+        r"\bsicepat\b", r"\bsi\s*cepat\b", r"\bsicep[a-z/]{0,3}t?\b",
+        r"\bhalu\s*5\b", r"\bhalu\s*ribu\b", r"halu.{0,3}5.{0,3}ribu",
+        r"\bribu\b", r"\b0046\d{8}\b"], "priority": 9},
+    {"kurir": "JNT LEX", "patterns": [r"\bjnt\s*lex\b", r"\bJNTLEX\d+\b"], "priority": 10},
+    {"kurir": "J&T", "patterns": [
+        r"\bj\s*&\s*t\b", r"\bjnt\s*express\b", r"\bjnt\b",
+        r"\bjet\.co\.id\b", r"\b(?:JX|JT|JP)\d{8,}\b"], "priority": 9},
+    {"kurir": "JNE LEX", "patterns": [r"\bjne\s*lex\b", r"\bjnex\b"], "priority": 10},
+    {"kurir": "JNE", "patterns": [r"\bjne\s*(?:express|reg|yes|oke|trucking)?\b"], "priority": 9},
+    {"kurir": "Anteraja", "patterns": [
+        r"\banteraja\b", r"\bantar\s*aja\b", r"pakeko\s*aja",
+        r"\bpakeko\b", r"\bPLBX?\d*\b", r"\bTSA-\d{6,}\b"], "priority": 9},
+    {"kurir": "GTL", "patterns": [r"\bgtl\b", r"goto\s*logistics"], "priority": 9},
+    {"kurir": "Ninja Xpress", "patterns": [r"\bninja\s*xpress\b", r"\bninjaxpress\b", r"\blnid\d+\b"], "priority": 9},
+    {"kurir": "Ninja LEX", "patterns": [r"\bninja\s*lex\b", r"\bnlex\b"], "priority": 10},
+    {"kurir": "SAP", "patterns": [r"\bsap\s*express\b", r"\bsap\b"], "priority": 8},
+    {"kurir": "SAP LEX", "patterns": [r"\bsap\s*lex\b"], "priority": 10},
+    {"kurir": "Ninja Pusat", "patterns": [r"\bninja\s*pusat\b", r"\bninjapusat\b"], "priority": 10},
+    {"kurir": "ID Express", "patterns": [r"\bid\s*express\b", r"\bidexpress\b", r"\bidexp\b"], "priority": 9},
+    {"kurir": "Pos Indonesia", "patterns": [r"\bpos\s*indonesia\b", r"\bpt\s*pos\b", r"\bpos\b"], "priority": 8},
+    {"kurir": "Lion Parcel", "patterns": [r"\blion\s*parcel\b", r"\blionparcel\b", r"\blion\b"], "priority": 8},
+    {"kurir": "Instan", "patterns": [r"\binstan\b", r"\bsameday\b", r"\bsame\s*day\b", r"\binstant\b"], "priority": 9},
+    {"kurir": "Sentral Cargo", "patterns": [r"\bsentral\s*cargo\b", r"\bsentral\b"], "priority": 9},
 ]
 
 KURIR_LIST             = [r["kurir"] for r in KURIR_RULES]
 KURIR_BELUM_TERDETEKSI = "Belum-Terdeteksi"
-KURIR_MULTI_PRODUK     = "Multi-produk"
 
 
 def detect_kurir(text: str) -> str | None:
@@ -497,11 +334,9 @@ def _ocr_logo(png_bytes: bytes) -> str:
 
 # ══════════════════════════════════════════════════════════════
 #  GROQ VISION FALLBACK (Layer 3)
-#  Llama 4 Scout untuk logo stylized seperti HALU yg gagal di Tesseract
 # ══════════════════════════════════════════════════════════════
 
 def _get_groq_api_key() -> str | None:
-    """Ambil GROQ_API_KEY dari Streamlit secrets, return None kalau tidak ada."""
     try:
         return st.secrets.get("GROQ_API_KEY", None)
     except Exception:
@@ -509,9 +344,6 @@ def _get_groq_api_key() -> str | None:
 
 
 def _groq_detect_kurir(png_bytes: bytes, api_key: str | None = None) -> str | None:
-    """Deteksi kurir dari image label menggunakan Groq Vision (Llama 4 Scout).
-    Return canonical kurir name (sesuai KURIR_RULES) atau None kalau gagal/tidak yakin.
-    """
     if not api_key:
         api_key = _get_groq_api_key()
     if not api_key:
@@ -531,41 +363,31 @@ def _groq_detect_kurir(png_bytes: bytes, api_key: str | None = None) -> str | No
         )
         resp = client.chat.completions.create(
             model="meta-llama/llama-4-scout-17b-16e-instruct",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                ],
-            }],
-            max_tokens=20,
-            temperature=0,
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+            ]}],
+            max_tokens=20, temperature=0,
         )
         result = (resp.choices[0].message.content or "").strip()
         result_lower = result.lower()
         if "unknown" in result_lower or not result_lower:
             return None
-        # Match canonical kurir
         for k in kurir_options:
             kl = k.lower()
             if kl in result_lower or kl.replace(" ", "") in result_lower.replace(" ", ""):
                 return k
-        # Aliases / common mistakes
-        if "halu" in result_lower or "sicep" in result_lower:
-            return "SiCepat"
-        if "jnt" in result_lower or "j&t" in result_lower or "j and t" in result_lower:
-            return "J&T"
-        if "shopee" in result_lower:
-            return "SPX"
-        if "ninja" in result_lower:
-            return "Ninja Xpress"
+        if "halu" in result_lower or "sicep" in result_lower: return "SiCepat"
+        if "jnt" in result_lower or "j&t" in result_lower: return "J&T"
+        if "shopee" in result_lower: return "SPX"
+        if "ninja" in result_lower: return "Ninja Xpress"
         return None
     except Exception:
         return None
 
 
 # ══════════════════════════════════════════════════════════════
-#  PARSE PRODUK  (standalone, tidak butuh app.py)
+#  PARSE PRODUK
 # ══════════════════════════════════════════════════════════════
 
 PRODUK_PATTERNS = [
@@ -594,9 +416,6 @@ PRODUK_PATTERNS = [
     (r"beauty\s*of\s*angel",     "BOA Produk"),
 ]
 
-
-# ── SKU → nama produk mapping (machine-printed, tidak pernah garbled oleh watermark) ──
-# Urutkan dari yang PALING SPESIFIK dulu (ABLTS sebelum ABLT)
 _SKU_TO_PRODUK = [
     (r"0208.BLTS",   "Body Lotion Sachet"),
     (r"0208.BLT",    "Body Lotion"),
@@ -621,7 +440,6 @@ _SKU_TO_PRODUK = [
 
 
 def _sku_to_produk_name(sku_code: str) -> str | None:
-    """Lookup produk dari SKU code. Returns nama produk atau None."""
     for pattern, nama in _SKU_TO_PRODUK:
         if re.search(pattern, sku_code, re.IGNORECASE):
             return nama
@@ -629,40 +447,24 @@ def _sku_to_produk_name(sku_code: str) -> str | None:
 
 
 def _parse_merchant_table(text_clean: str) -> tuple:
-    """
-    Dari J&T 2nd print, extract (merchant_title_text, sku_code, qty) dari Merchant Title table.
-
-    Format tabel: header 'Merchant Title SKU Qty', lalu baris data:
-        [title teks] [SKU_CODE ≥6 char] [qty angka]
-
-    SKU code adalah machine-printed → tidak pernah garbled walau ada COD watermark.
-    Catatan: posisi tabel di text bervariasi — bisa SEBELUM atau SESUDAH Order ID/Package ID,
-    tergantung layout halaman. Regex tidak pakai end-anchor supaya selalu ketemu.
-
-    Returns: (title_str, sku_code, qty_int) atau (None, None, None) kalau tidak ditemukan.
-    """
     merch_m = re.search(
         r"Merchant\s+Title\s+SKU\s+Qty(.+)",
         text_clean, re.DOTALL | re.IGNORECASE
     )
     if not merch_m:
         return None, None, None
-
     section = merch_m.group(1)
     for line in section.split("\n"):
         line = line.strip()
         if not line or re.search(r"qty\s+total", line, re.IGNORECASE):
             continue
-        # Format baris: [title bebas] [SKU ≥6 alphanum] [qty digit] di akhir baris
         m = re.search(r"^(.+?)\s+\b([A-Z0-9]{6,})\s+(\d+)\s*$", line)
         if m:
-            return m.group(1).strip(), m.group(2).strip(), int(m.group(3))  # (title, sku, qty)
-
+            return m.group(1).strip(), m.group(2).strip(), int(m.group(3))
     return None, None, None
 
 
 def _base_produk(sku_name: str) -> str:
-    """Strip qty suffix: 'Body Lotion 2 PCS' → 'Body Lotion', 'Glow Soap 5 PCS' → 'Glow Soap'."""
     return re.sub(r"\s*\d+\s*PCS\s*$", "", sku_name, flags=re.IGNORECASE).strip()
 
 
@@ -670,18 +472,9 @@ def parse_produk(text: str) -> dict:
     if not text:
         return {}
 
-    # ── Strip baris Pengirim/Sender supaya nama toko gak false-match ──
-    # (contoh: "Lip serum beauty of angel" di nama pengirim J&T)
     text_clean = re.sub(r"(?:Pengirim|Sender)\s*[:\(][^\n]*\n?", "", text, flags=re.IGNORECASE)
-
-    # ── Baca Merchant Title table (J&T 2nd print) — sumber paling akurat ──
-    # Memberikan (title_text, sku_code, qty) langsung dari tabel di 2nd print.
-    # SKU code adalah machine-printed → TIDAK pernah garbled oleh COD watermark.
     merch_title, table_sku, table_qty = _parse_merchant_table(text_clean)
 
-    # ── SHORT-CIRCUIT via SKU: jika SKU dikenal → return langsung, skip text matching ──
-    # Ini solusi untuk COD watermark yang garble teks Barang & Merchant Title,
-    # tapi TIDAK pernah garble SKU code (machine-printed).
     if table_sku:
         sku_produk = _sku_to_produk_name(table_sku)
         if sku_produk:
@@ -689,39 +482,29 @@ def parse_produk(text: str) -> dict:
             key = f"{sku_produk} {qty} PCS" if qty > 1 else sku_produk
             return {key: 1}
 
-    # Untuk pattern matching: gabungkan text_clean + merchant title (kalau ada)
-    # → merchant title selalu clean, membantu kalau teks utama garbled/berantakan
     search_text = text_clean
     if merch_title:
         search_text = text_clean + "\n" + merch_title
 
-    # ── Cek apakah ada field "Barang :" (format J&T) — fallback qty source ──
     barang_m = re.search(r"Barang\s*:\s*(.+?)(?:\n|$)", text_clean, re.IGNORECASE)
 
     hasil        = {}
-    matched_base: set[str] = set()   # untuk exclusive matching: skip parent kalau child sudah match
+    matched_base: set[str] = set()
 
     for pat, nama in PRODUK_PATTERNS:
         if not re.search(pat, search_text, re.IGNORECASE):
             continue
-
-        # ── Exclusive matching: skip jika variant lebih spesifik sudah match ──
-        # Contoh: "Body Lotion Sachet" → skip "Body Lotion" supaya gak double-count
         nama_upper = nama.upper()
         if any(matched.startswith(nama_upper + " ") for matched in matched_base):
             continue
         matched_base.add(nama_upper)
 
-        # ── Qty priority: Merchant table > Barang PCS > last-occurrence window ──
         if table_qty is not None:
             qty = table_qty
         elif barang_m:
-            # J&T Barang field (V Name): "4 PCOS", "2 PCS BODY LOTION", "BELI 1 COD" (no PCS → qty=1)
             m_qty = re.search(r"(\d+)\s*PC[SO]+", barang_m.group(1), re.IGNORECASE)
             qty = int(m_qty.group(1)) if m_qty else 1
         else:
-            # Non-J&T (SPX, Anteraja, dll): cari qty di sekitar LAST match keyword produk
-            # V Name selalu muncul setelah Merchant Title → last occurrence = V Name context
             all_matches = list(re.finditer(pat, text_clean, re.IGNORECASE))
             last_m = all_matches[-1]
             window = text_clean[max(0, last_m.start() - 40): last_m.end() + 60]
@@ -732,14 +515,11 @@ def parse_produk(text: str) -> dict:
         hasil[key] = hasil.get(key, 0) + 1
 
     if len(hasil) > 1:
-        # BOA-specific: "Body Lotion With Sunscreen" adalah 1 produk (bukan 2 terpisah).
-        # Kalau body lotion + sunscreen sama-sama detect di satu halaman → drop sunscreen.
         bl_keys = [k for k in list(hasil) if _base_produk(k) == "Body Lotion"]
         ss_keys = [k for k in list(hasil) if _base_produk(k) == "Sunscreen"]
         if bl_keys and ss_keys:
             for k in ss_keys:
                 del hasil[k]
-
         boa_keys = [k for k in list(hasil) if k == "BOA Produk" or k.startswith("BOA Produk ")]
         for k in boa_keys:
             del hasil[k]
@@ -790,18 +570,15 @@ def _is_multi(parse_result: dict) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════
-#  SLUG HELPERS  (untuk nama file PDF)
+#  SLUG HELPERS
 # ══════════════════════════════════════════════════════════════
 
 def _camel(text: str) -> str:
-    """Capitalize each word, no spaces. Preserves existing uppercase.
-    'Glow Soap' → 'GlowSoap', 'BOA Produk' → 'BOAProduk'."""
     parts = re.split(r"\s+", text.strip())
     return "".join((p[0].upper() + p[1:]) if p else "" for p in parts)
 
 
 def _produk_slug(produk_name: str) -> str:
-    """Convert 'Glow Soap 5 PCS' → 'GlowSoap_5PCS'."""
     s = produk_name.strip()
     m = re.search(r"^(.+?)\s+(\d+)\s*PCS\s*$", s, re.IGNORECASE)
     if m:
@@ -811,32 +588,360 @@ def _produk_slug(produk_name: str) -> str:
 
 
 _KURIR_FILENAME_ALIAS = {
-    "SPX":           "SPX",
-    "J&T":           "JNT",
-    "JNT LEX":       "JNTLEX",
-    "SiCepat":       "CPT",
-    "JNE":           "JNE",
-    "JNE LEX":       "JLEX",
-    "Anteraja":      "ANTER",
-    "GTL":           "GTL",
-    "Ninja Xpress":  "NP",
-    "Ninja LEX":     "NLEX",
-    "Ninja Pusat":   "NP",
-    "SAP":           "SAP",
-    "SAP LEX":       "SAPLEX",
-    "ID Express":    "ID",
-    "Pos Indonesia":  "POS",
-    "Lion Parcel":   "LION",
-    "Instan":        "INSTAN",
+    "SPX": "SPX", "J&T": "JNT", "JNT LEX": "JNTLEX", "SiCepat": "CPT",
+    "JNE": "JNE", "JNE LEX": "JLEX", "Anteraja": "ANTER", "GTL": "GTL",
+    "Ninja Xpress": "NP", "Ninja LEX": "NLEX", "Ninja Pusat": "NP",
+    "SAP": "SAP", "SAP LEX": "SAPLEX", "ID Express": "ID",
+    "Pos Indonesia": "POS", "Lion Parcel": "LION", "Instan": "INSTAN",
     "Sentral Cargo": "SENTRAL",
 }
 
 
 def _kurir_slug(kurir: str) -> str:
-    """Convert 'J&T' → 'JNT', 'Ninja Xpress' → 'NinjaXpress', dll."""
     if kurir in _KURIR_FILENAME_ALIAS:
         return _KURIR_FILENAME_ALIAS[kurir]
     return re.sub(r"[^\w\-]", "", kurir.replace("&", ""))
+
+
+# ══════════════════════════════════════════════════════════════
+#  KLOTERAN ENGINE
+# ══════════════════════════════════════════════════════════════
+
+# Nama singkatan produk untuk print sheet kloteran
+_PRODUK_SINGKAT = {
+    "Body Lotion":        "Body Lotion",
+    "Body Lotion Sachet": "BL Sachet",
+    "Lip Serum":          "Lip Serum",
+    "Glow Soap":          "Glow Soap",
+    "Eye Cream":          "Eye Cream",
+    "Underarm":           "Underarm",
+    "Feminine Spray":     "Fem Spray",
+    "Men Care":           "Men Care",
+    "Sunscreen":          "Sunscreen",
+    "Peeling Serum":      "Peeling Serum",
+    "Parfume":            "Parfume",
+    "Toner":              "Toner",
+    "Build Your Chapter": "Build YC",
+    "Collagen Drink":     "Collagen",
+    "Day Cream":          "Day Cream",
+    "Night Gel":          "Night Gel",
+    "Facial Wash":        "Facial Wash",
+    "Meili Beauty Cream": "Meili",
+    "Brightening Serum":  "Bright Serum",
+    "Moist Serum":        "Moist Serum",
+    "Acne Serum":         "Acne Serum",
+    "Serum Glow":         "Serum Glow",
+    "Body Wash":          "Body Wash",
+}
+
+
+def _singkat_produk(nama: str) -> str:
+    """Ambil nama singkat produk. Strip PCS suffix dulu, lalu lookup."""
+    base = re.sub(r"\s*\d+\s*PCS\s*$", "", nama, flags=re.IGNORECASE).strip()
+    short = _PRODUK_SINGKAT.get(base, base)
+    # Cek apakah ada qty suffix
+    m = re.search(r"(\d+)\s*PCS", nama, re.IGNORECASE)
+    if m:
+        return f"{short} {m.group(1)}pcs"
+    return short
+
+
+def _kloteran_label(nomor: int, tanggal: datetime) -> str:
+    """Ganjil → angka (1,2,3), Genap → huruf (A,B,C)."""
+    if tanggal.day % 2 == 1:  # ganjil
+        return str(nomor)
+    else:  # genap
+        # 1→A, 2→B, dst
+        letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        return letters[nomor - 1] if nomor <= 26 else str(nomor)
+
+
+def assign_kloteran(
+    groups: dict,
+    tanggal: datetime,
+    batas_single: int = 50,
+    batas_multi: int = 10,
+) -> list[dict]:
+    """
+    Auto-assign kloteran dari groups hasil split_pdf_by_kurir.
+
+    Returns list of kloteran dicts:
+    {
+        "nomor": int,
+        "label": str,           # "1" atau "A" tergantung tanggal
+        "kurir": str,
+        "is_multi": bool,
+        "produk_list": [str],   # list produk (singkat), untuk multi: semua varian
+        "produk_display": str,  # "Body Lotion" / "BL Sachet / Lip Serum"
+        "jumlah_resi": int,
+        "group_key": str,       # key di groups dict
+        "page_indices": [int],  # list halaman asli PDF
+    }
+    """
+    kloterans = []
+    counter   = 1
+
+    # Sort groups: non-multi dulu, lalu multi
+    all_keys = [k for k in sorted(groups.keys()) if not k.startswith("_")]
+    non_multi = [k for k in all_keys if not k.endswith("_Multi") and k != KURIR_BELUM_TERDETEKSI]
+    multi     = [k for k in all_keys if k.endswith("_Multi")]
+    undetect  = [k for k in all_keys if k == KURIR_BELUM_TERDETEKSI]
+    ordered   = non_multi + multi + undetect
+
+    for gkey in ordered:
+        d = groups[gkey]
+        if not d.get("pages"):
+            continue
+
+        kurir    = d.get("kurir") or "—"
+        is_multi = gkey.endswith("_Multi") or gkey == KURIR_BELUM_TERDETEKSI
+        batas    = batas_multi if is_multi else batas_single
+
+        # Kumpulkan semua page index dari group ini (sudah di-sort oleh sort_key)
+        sorted_pages = sorted(d["pages"], key=lambda x: x[2])
+        all_idx = [idx for idx, _, _ in sorted_pages]
+
+        # Ambil produk list untuk display
+        if is_multi:
+            # List semua produk unik yang ada di kloteran ini
+            produk_set = []
+            for _, parse_result, _ in sorted_pages:
+                for p in parse_result:
+                    base = _base_produk(p)
+                    short = _singkat_produk(base)
+                    if short not in produk_set:
+                        produk_set.append(short)
+            produk_list = produk_set
+        else:
+            # Single produk — ambil dari group key
+            produk_name = d.get("produk") or gkey
+            produk_list = [_singkat_produk(produk_name)]
+
+        # Pecah jadi kloteran sesuai batas
+        chunks = [all_idx[i:i+batas] for i in range(0, len(all_idx), batas)]
+
+        for chunk_idx in chunks:
+            produk_display = " / ".join(produk_list) if is_multi else produk_list[0]
+            label = _kloteran_label(counter, tanggal)
+
+            kloterans.append({
+                "nomor":          counter,
+                "label":          label,
+                "kurir":          kurir,
+                "is_multi":       is_multi,
+                "produk_list":    produk_list,
+                "produk_display": produk_display,
+                "jumlah_resi":    len(chunk_idx),
+                "group_key":      gkey,
+                "page_indices":   chunk_idx,
+            })
+            counter += 1
+
+    return kloterans
+
+
+# ══════════════════════════════════════════════════════════════
+#  BUILD KLOTERAN EXCEL
+# ══════════════════════════════════════════════════════════════
+
+def build_kloteran_excel(
+    kloterans: list[dict],
+    tanggal: datetime,
+    nama_admin: str,
+) -> bytes:
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Kloteran"
+
+    HEAD_FILL  = PatternFill("solid", fgColor="C49166")
+    HEAD_FONT  = Font(bold=True, color="15110D", size=11)
+    CENTER     = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    LEFT       = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+    MULTI_FILL = PatternFill("solid", fgColor="2E251E")
+    MULTI_FONT = Font(color="D4A574", size=10)
+
+    thin = Side(style="thin", color="3A2F26")
+    BORDER = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # Header info
+    ws.merge_cells("A1:F1")
+    ws["A1"] = f"REKAP KLOTERAN — {tanggal.strftime('%d %B %Y')} — Admin: {nama_admin}"
+    ws["A1"].font = Font(bold=True, size=13, color="F0E4D2")
+    ws["A1"].fill = PatternFill("solid", fgColor="15110D")
+    ws["A1"].alignment = CENTER
+    ws.row_dimensions[1].height = 28
+
+    ws.merge_cells("A2:F2")
+    ws["A2"] = f"Total Kloteran: {len(kloterans)}"
+    ws["A2"].font = Font(size=10, color="8A7A66")
+    ws["A2"].alignment = LEFT
+    ws.row_dimensions[2].height = 18
+
+    # Column headers
+    headers = ["Kloteran", "Kurir", "Produk", "Jumlah Resi", "Tipe", "Catatan"]
+    for col, h in enumerate(headers, 1):
+        c = ws.cell(row=3, column=col, value=h)
+        c.font = HEAD_FONT
+        c.fill = HEAD_FILL
+        c.alignment = CENTER
+        c.border = BORDER
+    ws.row_dimensions[3].height = 22
+
+    # Data rows
+    for i, kl in enumerate(kloterans, start=4):
+        is_m  = kl["is_multi"]
+        catatan = kl["produk_display"] if is_m else ""
+        produk_cell = kl["produk_display"]
+
+        row_data = [
+            kl["label"],
+            kl["kurir"],
+            produk_cell,
+            kl["jumlah_resi"],
+            "Multi" if is_m else "Single",
+            catatan if is_m else "",
+        ]
+        for col, val in enumerate(row_data, 1):
+            c = ws.cell(row=i, column=col, value=val)
+            if is_m:
+                c.font = MULTI_FONT
+                c.fill = MULTI_FILL
+            c.alignment = CENTER if col != 3 else LEFT
+            c.border = BORDER
+        ws.row_dimensions[i].height = 32 if is_m else 22
+
+    # Column widths
+    ws.column_dimensions["A"].width = 12
+    ws.column_dimensions["B"].width = 14
+    ws.column_dimensions["C"].width = 36
+    ws.column_dimensions["D"].width = 14
+    ws.column_dimensions["E"].width = 10
+    ws.column_dimensions["F"].width = 40
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ══════════════════════════════════════════════════════════════
+#  BUILD KLOTERAN PDF (Print Sheet)
+# ══════════════════════════════════════════════════════════════
+
+def build_kloteran_pdf(
+    kloterans: list[dict],
+    tanggal: datetime,
+    nama_admin: str,
+) -> bytes:
+    """
+    Build print sheet HTML → convert ke PDF pakai WeasyPrint.
+    Fallback: return HTML bytes kalau WeasyPrint tidak tersedia.
+    1 halaman A4, semua kloteran dalam 1 tabel bersih.
+    """
+    tgl_str = tanggal.strftime("%d %B %Y")
+
+    rows_html = ""
+    for kl in kloterans:
+        is_m = kl["is_multi"]
+        tipe_badge = (
+            '<span style="background:#D4A574;color:#15110D;padding:2px 7px;'
+            'border-radius:999px;font-size:9px;font-weight:700;">MULTI</span>'
+            if is_m else
+            '<span style="background:#3A2F26;color:#C9B89F;padding:2px 7px;'
+            'border-radius:999px;font-size:9px;">SINGLE</span>'
+        )
+        produk_html = kl["produk_display"].replace(" / ", "<br/>") if is_m else kl["produk_display"]
+        row_bg = "#1e1a16" if is_m else "#15110D"
+        rows_html += f"""
+        <tr style="background:{row_bg};">
+            <td style="text-align:center;font-weight:700;font-size:15px;color:#C49166;">{kl['label']}</td>
+            <td style="text-align:center;color:#F0E4D2;">{kl['kurir']}</td>
+            <td style="color:{'#D4A574' if is_m else '#F0E4D2'};line-height:1.5;">{produk_html}</td>
+            <td style="text-align:center;font-weight:700;font-size:14px;color:#F0E4D2;">{kl['jumlah_resi']}</td>
+            <td style="text-align:center;">{tipe_badge}</td>
+            <td style="color:#6B5D4D;font-size:10px;"></td>
+        </tr>"""
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<style>
+  @page {{ size: A4; margin: 14mm 12mm; }}
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ background: #15110D; color: #F0E4D2;
+          font-family: 'Segoe UI', Arial, sans-serif; font-size: 11px; }}
+  .header {{ display:flex; justify-content:space-between; align-items:flex-end;
+             border-bottom: 1.5px solid #C49166; padding-bottom: 8px; margin-bottom: 12px; }}
+  .header-left h1 {{ font-size: 16px; font-weight: 700; color: #C49166; }}
+  .header-left p  {{ font-size: 10px; color: #8A7A66; margin-top: 2px; }}
+  .header-right   {{ font-size: 10px; color: #8A7A66; text-align: right; line-height: 1.6; }}
+  table {{ width: 100%; border-collapse: collapse; }}
+  thead tr {{ background: #C49166; }}
+  thead th {{ padding: 7px 8px; color: #15110D; font-weight: 700; font-size: 10px;
+              text-align: center; letter-spacing: .3px; }}
+  tbody tr {{ border-bottom: 0.5px solid #2E251E; }}
+  tbody td {{ padding: 7px 8px; vertical-align: middle; font-size: 10px; }}
+  .footer {{ margin-top: 12px; display:flex; justify-content:space-between;
+             font-size: 9px; color: #4A3A2C; border-top: 0.5px solid #2E251E; padding-top: 6px; }}
+  .summary {{ margin-bottom: 10px; display:flex; gap: 16px; }}
+  .badge {{ background: #1F1815; border: 0.5px solid #2E251E; border-radius: 8px;
+            padding: 5px 12px; }}
+  .badge span {{ display:block; font-size: 9px; color: #8A7A66; }}
+  .badge strong {{ font-size: 14px; color: #C49166; }}
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="header-left">
+    <h1>📋 Rekap Kloteran — BOA Sortir</h1>
+    <p>Tanggal: {tgl_str} &nbsp;·&nbsp; Admin: {nama_admin}</p>
+  </div>
+  <div class="header-right">
+    Beauty of Angel<br/>
+    Print: {datetime.now().strftime('%H:%M')} WIB
+  </div>
+</div>
+
+<div class="summary">
+  <div class="badge"><span>Total Kloteran</span><strong>{len(kloterans)}</strong></div>
+  <div class="badge"><span>Total Resi</span><strong>{sum(k['jumlah_resi'] for k in kloterans)}</strong></div>
+  <div class="badge"><span>Single</span><strong>{sum(1 for k in kloterans if not k['is_multi'])}</strong></div>
+  <div class="badge"><span>Multi</span><strong>{sum(1 for k in kloterans if k['is_multi'])}</strong></div>
+</div>
+
+<table>
+  <thead>
+    <tr>
+      <th style="width:9%">Kloteran</th>
+      <th style="width:14%">Kurir</th>
+      <th style="width:32%">Produk</th>
+      <th style="width:11%">Jml Resi</th>
+      <th style="width:10%">Tipe</th>
+      <th style="width:24%">Paraf / Catatan</th>
+    </tr>
+  </thead>
+  <tbody>
+    {rows_html}
+  </tbody>
+</table>
+
+<div class="footer">
+  <span>BOA Sortir Tools v1.1 — Crafted by Mashori</span>
+  <span>Dokumen internal — tidak untuk disebarkan</span>
+</div>
+</body>
+</html>"""
+
+    # Try WeasyPrint first, fallback to returning HTML
+    try:
+        from weasyprint import HTML as WP_HTML
+        pdf_bytes = WP_HTML(string=html).write_pdf()
+        return pdf_bytes, "pdf"
+    except Exception:
+        return html.encode("utf-8"), "html"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -850,12 +955,6 @@ def split_pdf_by_kurir(
     use_groq: bool = False,
     groq_api_key: str | None = None,
 ) -> dict:
-    """Hybrid grouping:
-      - Single-SKU resi grouped by (kurir, sku+qty); group >=2 → PDF sendiri.
-      - Orphan (group ==1) atau Multi-SKU resi → masuk {Kurir}_Multi.pdf.
-      - Kurir gagal detect → Belum-Terdeteksi.pdf.
-    Detection: Text → Tesseract OCR (if use_ocr) → Groq Vision (if use_groq).
-    """
     from pypdf import PdfReader
 
     pdf_bytes   = _repair_pdf(pdf_bytes)
@@ -863,9 +962,8 @@ def split_pdf_by_kurir(
     total_pages = len(reader.pages)
 
     method_counts = defaultdict(int)
-    pages_info    = []  # [{idx, kurir, parse_result, method, is_multi_sku}]
+    pages_info    = []
 
-    # ── PASS 1: Detect kurir + parse produk per halaman ──
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf_pl:
         for i in range(total_pages):
             if progress_cb:
@@ -877,7 +975,6 @@ def split_pdf_by_kurir(
             kurir  = detect_kurir(text)
             method = "text" if kurir else "none"
 
-            # Layer 2: Tesseract OCR (logo zone)
             if not kurir and use_ocr:
                 png = _render_page_png(pdf_bytes, i)
                 if png:
@@ -887,7 +984,6 @@ def split_pdf_by_kurir(
                         if kurir:
                             method = "ocr"
 
-            # Layer 3: Groq Vision (Llama 4 Scout) — last resort
             if not kurir and use_groq:
                 png = _render_page_png(pdf_bytes, i, dpi=150)
                 if png:
@@ -907,20 +1003,15 @@ def split_pdf_by_kurir(
                 "is_multi_sku": _is_multi(parse_result),
             })
 
-    # ── PASS 2: Group by (kurir, sku+qty) untuk single-SKU ──
-    # Grouping pakai nama LENGKAP termasuk qty: "Body Lotion" dan "Body Lotion 2 PCS"
-    # masuk grup terpisah supaya admin bisa pack sesuai varian.
     if progress_cb:
         progress_cb(total_pages, total_pages, "Mengelompokkan resi…")
 
-    # Hitung member per (kurir, sku_name) untuk single-SKU pages
     sku_count = defaultdict(int)
     for p in pages_info:
         if p["kurir"] and not p["is_multi_sku"] and p["parse_result"]:
             sku_name = next(iter(p["parse_result"].keys()))
             sku_count[(p["kurir"], sku_name)] += 1
 
-    # Assign final group key
     groups = defaultdict(lambda: {
         "pages": [],
         "total_resi": 0,
@@ -945,11 +1036,9 @@ def split_pdf_by_kurir(
             sku_name = next(iter(parse_result.keys()))
             count    = sku_count[(kurir, sku_name)]
             if count >= 2:
-                # Group ≥2 — PDF sendiri dengan nama lengkap termasuk qty
                 target = f"{_kurir_slug(kurir)}_{_produk_slug(sku_name)}"
                 grp_kurir, grp_produk = kurir, sku_name
             else:
-                # Orphan single-SKU → masuk Multi
                 target = f"{_kurir_slug(kurir)}_Multi"
                 grp_kurir, grp_produk = kurir, "Mixed (orphan + multi-SKU)"
 
@@ -1004,18 +1093,15 @@ def build_excel_rekap(groups: dict) -> bytes:
     from openpyxl.styles import Font, PatternFill, Alignment
     wb = openpyxl.Workbook()
 
-    HEAD_FILL = PatternFill("solid", fgColor="C49166")  # warm sand
+    HEAD_FILL = PatternFill("solid", fgColor="C49166")
     HEAD_FONT = Font(bold=True, color="15110D", size=11)
     CENTER    = Alignment(horizontal="center", vertical="center")
 
-    # ── Sheet 1: Ringkasan per file PDF ──
     ws1 = wb.active
     ws1.title = "Ringkasan"
     ws1.append(["File PDF", "Kurir", "Produk / Kategori", "Total Resi", "Total Batang"])
     for c in ws1[1]:
-        c.font = HEAD_FONT
-        c.fill = HEAD_FILL
-        c.alignment = CENTER
+        c.font = HEAD_FONT; c.fill = HEAD_FILL; c.alignment = CENTER
 
     sorted_keys = sorted(groups.keys())
     for name in sorted_keys:
@@ -1029,13 +1115,10 @@ def build_excel_rekap(groups: dict) -> bytes:
         total_b = sum(v for k, v in d["total_per_produk"].items() if k.startswith("_BATANG_"))
         ws1.append([f"{name}.pdf", kurir, produk, d["total_resi"], total_b])
 
-    # ── Sheet 2: Detail per (file × produk) ──
     ws2 = wb.create_sheet("Detail")
     ws2.append(["File PDF", "Kurir", "Produk", "Jumlah Resi", "Total Batang"])
     for c in ws2[1]:
-        c.font = HEAD_FONT
-        c.fill = HEAD_FILL
-        c.alignment = CENTER
+        c.font = HEAD_FONT; c.fill = HEAD_FILL; c.alignment = CENTER
 
     for name in sorted_keys:
         if name.startswith("_"):
@@ -1074,6 +1157,38 @@ def build_zip(output_pdfs: dict, excel_bytes: bytes | None = None) -> bytes:
 
 
 # ══════════════════════════════════════════════════════════════
+#  SIDEBAR — SETTINGS KLOTERAN
+# ══════════════════════════════════════════════════════════════
+
+with st.sidebar:
+    st.markdown("""
+    <div style="font-size:13px;font-weight:700;color:#C49166;margin-bottom:8px;">
+        ⚙️ Settings Kloteran
+    </div>
+    """, unsafe_allow_html=True)
+
+    tgl_default = (datetime.utcnow() + timedelta(hours=7)).date()
+    tgl_kloteran = st.date_input("Tanggal Sortir", value=tgl_default, key="tgl_kloteran")
+    nama_admin   = st.text_input("Nama Admin", value="Admin", key="nama_admin",
+                                  placeholder="Nama admin / operator")
+    batas_single = st.number_input("Batas resi Single/kloteran", min_value=1, max_value=200,
+                                    value=50, step=5, key="batas_single",
+                                    help="Jumlah maksimal resi 1 produk per kloteran")
+    batas_multi  = st.number_input("Batas resi Multi/kloteran", min_value=1, max_value=50,
+                                    value=10, step=1, key="batas_multi",
+                                    help="Jumlah maksimal resi campur per kloteran (lebih kecil, lebih teliti)")
+
+    st.divider()
+    st.markdown("""
+    <div style="font-size:11px;color:#6B5D4D;line-height:1.6;">
+    <b style="color:#C9B89F;">Penomoran:</b><br/>
+    Tanggal ganjil → 1, 2, 3 …<br/>
+    Tanggal genap → A, B, C …
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════
 #  MAIN UI  (sudah login)
 # ══════════════════════════════════════════════════════════════
 
@@ -1088,7 +1203,7 @@ with col_h1:
                     box-shadow:0 2px 8px rgba(196,145,102,0.3);">S</div>
         <div>
             <div style="font-size:20px;font-weight:700;line-height:1.2;color:#F0E4D2;">BOA Sortir Tools</div>
-            <div style="font-size:12px;color:#8A7A66;">Pemisah resi otomatis per ekspedisi</div>
+            <div style="font-size:12px;color:#8A7A66;">Pemisah resi otomatis per ekspedisi + Kloteran</div>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1099,153 +1214,271 @@ with col_h2:
 
 st.divider()
 
-st.markdown("#### 📤 Upload PDF Resi")
-st.caption(
-    "Upload **1 file PDF** berisi label resi campuran dari berbagai ekspedisi. "
-    "Tools akan memisahnya menjadi PDF per kurir, lalu di-bundle ke 1 file ZIP."
-)
+# ── Tabs: Sortir & Kloteran ──
+tab_sortir, tab_kloteran = st.tabs(["📤 Sortir Resi", "📋 Kloteran"])
 
-uploaded = st.file_uploader(
-    "Pilih file PDF",
-    type=["pdf"],
-    key="sortir_upload",
-    label_visibility="collapsed",
-)
+# ══════════════════════════════════════════════════════════════
+#  TAB 1: SORTIR RESI
+# ══════════════════════════════════════════════════════════════
 
-_GROQ_KEY_AVAILABLE = bool(_get_groq_api_key())
-
-col_o1, col_o2, col_o3 = st.columns(3)
-with col_o1:
-    gen_excel = st.checkbox("📊 Rekap Excel", value=True, key="opt_excel",
-                            help="Sertakan file Rekap.xlsx di dalam ZIP")
-with col_o2:
-    use_ocr = st.checkbox(
-        "🔍 OCR Tesseract",
-        value=True,
-        key="opt_ocr",
-        help="Layer 2: OCR pojok kanan-atas (Tesseract). Cepat, gratis, lokal. "
-             "Aktif kalau Text gagal baca kurir.",
-    )
-with col_o3:
-    use_groq = st.checkbox(
-        "🤖 Groq Vision",
-        value=_GROQ_KEY_AVAILABLE,
-        disabled=not _GROQ_KEY_AVAILABLE,
-        key="opt_groq",
-        help=(
-            "Layer 3: Groq Vision (Llama 4 Scout) untuk logo stylized seperti HALU. "
-            "Aktif kalau Text + Tesseract gagal. Lebih akurat tapi lambat (~2-3 dtk/halaman) "
-            "& pakai API quota."
-            if _GROQ_KEY_AVAILABLE else
-            "Disabled — GROQ_API_KEY tidak ditemukan di .streamlit/secrets.toml"
-        ),
+with tab_sortir:
+    st.markdown("#### 📤 Upload PDF Resi")
+    st.caption(
+        "Upload **1 file PDF** berisi label resi campuran dari berbagai ekspedisi. "
+        "Tools akan memisahnya menjadi PDF per kurir, lalu di-bundle ke 1 file ZIP."
     )
 
-if uploaded is None:
-    st.info("⬆️ Upload PDF resi dulu untuk memulai.")
-    st.stop()
+    uploaded = st.file_uploader(
+        "Pilih file PDF",
+        type=["pdf"],
+        key="sortir_upload",
+        label_visibility="collapsed",
+    )
 
-if st.button("🚀 Mulai Sortir", type="primary", use_container_width=True, key="btn_run"):
-    pdf_bytes = uploaded.read()
+    _GROQ_KEY_AVAILABLE = bool(_get_groq_api_key())
 
-    progress_bar = st.progress(0.0)
-    status_text  = st.empty()
+    col_o1, col_o2, col_o3 = st.columns(3)
+    with col_o1:
+        gen_excel = st.checkbox("📊 Rekap Excel", value=True, key="opt_excel",
+                                help="Sertakan file Rekap.xlsx di dalam ZIP")
+    with col_o2:
+        use_ocr = st.checkbox("🔍 OCR Tesseract", value=True, key="opt_ocr",
+                               help="Layer 2: OCR pojok kanan-atas (Tesseract).")
+    with col_o3:
+        use_groq = st.checkbox(
+            "🤖 Groq Vision",
+            value=_GROQ_KEY_AVAILABLE,
+            disabled=not _GROQ_KEY_AVAILABLE,
+            key="opt_groq",
+            help=(
+                "Layer 3: Groq Vision (Llama 4 Scout)."
+                if _GROQ_KEY_AVAILABLE else
+                "Disabled — GROQ_API_KEY tidak ditemukan."
+            ),
+        )
 
-    def _cb(current, total, msg):
-        progress_bar.progress(min(current / max(total, 1), 1.0))
-        status_text.text(msg)
+    if uploaded is None:
+        st.info("⬆️ Upload PDF resi dulu untuk memulai.")
+    elif st.button("🚀 Mulai Sortir", type="primary", use_container_width=True, key="btn_run"):
+        pdf_bytes = uploaded.read()
 
-    with st.spinner("Mengklasifikasi resi per kurir…"):
-        try:
-            groups = split_pdf_by_kurir(
-                pdf_bytes,
-                progress_cb=_cb,
-                use_ocr=use_ocr,
-                use_groq=use_groq,
-            )
-        except Exception as e:
-            st.error(f"❌ Gagal memproses PDF: {e}")
+        progress_bar = st.progress(0.0)
+        status_text  = st.empty()
+
+        def _cb(current, total, msg):
+            progress_bar.progress(min(current / max(total, 1), 1.0))
+            status_text.text(msg)
+
+        with st.spinner("Mengklasifikasi resi per kurir…"):
+            try:
+                groups = split_pdf_by_kurir(
+                    pdf_bytes, progress_cb=_cb,
+                    use_ocr=use_ocr, use_groq=use_groq,
+                )
+            except Exception as e:
+                st.error(f"❌ Gagal memproses PDF: {e}")
+                st.stop()
+
+        progress_bar.progress(1.0)
+        status_text.empty()
+
+        meta = groups.pop("_meta", {})
+
+        if not groups:
+            st.error("❌ Tidak ada halaman yang berhasil diproses.")
             st.stop()
 
-    progress_bar.progress(1.0)
-    status_text.empty()
+        # Simpan ke session state supaya bisa dipakai di tab Kloteran
+        st.session_state["groups"]    = groups
+        st.session_state["pdf_bytes"] = pdf_bytes
 
-    meta = groups.pop("_meta", {})
+        mc     = meta.get("method_counts", {})
+        labels = {"text": "📄 Text", "ocr": "🔍 OCR", "groq": "🤖 Groq", "none": "❓ Tidak terdeteksi"}
+        parts  = [f"{labels.get(m, m)}: **{n}**" for m, n in mc.items() if n > 0]
+        if parts:
+            st.caption("Metode deteksi: " + " · ".join(parts))
 
-    if not groups:
-        st.error("❌ Tidak ada halaman yang berhasil diproses.")
+        st.markdown("#### 📊 Ringkasan Hasil Sortir")
+        rows = []
+        for name in sorted(groups.keys()):
+            d       = groups[name]
+            kurir   = d.get("kurir") or "—"
+            produk  = d.get("produk") or "Mixed"
+            total_b = sum(v for k, v in d["total_per_produk"].items() if k.startswith("_BATANG_"))
+            rows.append({
+                "File PDF": f"{name}.pdf",
+                "Kurir": kurir,
+                "Produk / Kategori": produk,
+                "Total Resi": d["total_resi"],
+                "Total Batang": total_b,
+            })
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+        with st.spinner("Menyusun PDF tersortir…"):
+            output_pdfs = build_output_pdfs(pdf_bytes, groups)
+
+        excel_bytes = None
+        if gen_excel:
+            with st.spinner("Membuat rekap Excel…"):
+                try:
+                    excel_bytes = build_excel_rekap(groups)
+                except Exception:
+                    excel_bytes = None
+                    st.warning("⚠️ openpyxl tidak terpasang — ZIP dibuat tanpa Excel.")
+
+        zip_bytes = build_zip(output_pdfs, excel_bytes)
+        timestamp = (datetime.utcnow() + timedelta(hours=7)).strftime("%Y%m%d_%H%M")
+
+        st.success(
+            f"✅ Selesai! **{len(output_pdfs)} PDF** kurir tersortir"
+            + (" + rekap Excel" if excel_bytes else "")
+            + " — siap download."
+        )
+
+        st.download_button(
+            label=f"⬇️ Download sortir_resi_{timestamp}.zip",
+            data=zip_bytes,
+            file_name=f"sortir_resi_{timestamp}.zip",
+            mime="application/zip",
+            type="primary",
+            use_container_width=True,
+        )
+
+        with st.expander("📋 Detail per kurir / kategori"):
+            for name in sorted(groups.keys()):
+                d = groups[name]
+                st.markdown(f"**{name}** — {d['total_resi']} resi")
+                detail = [
+                    {
+                        "Produk": prod,
+                        "Jumlah Resi": n,
+                        "Total Batang": d["total_per_produk"].get(f"_BATANG_{prod}", n),
+                    }
+                    for prod, n in sorted(d["total_per_produk"].items())
+                    if not prod.startswith("_BATANG_")
+                ]
+                if detail:
+                    st.dataframe(pd.DataFrame(detail), hide_index=True, use_container_width=True)
+                st.markdown("---")
+
+        st.info("💡 Buka tab **📋 Kloteran** untuk generate rekap kloteran dari hasil sortir ini.")
+
+
+# ══════════════════════════════════════════════════════════════
+#  TAB 2: KLOTERAN
+# ══════════════════════════════════════════════════════════════
+
+with tab_kloteran:
+    st.markdown("#### 📋 Rekap Kloteran")
+
+    groups    = st.session_state.get("groups", None)
+    pdf_bytes = st.session_state.get("pdf_bytes", None)
+
+    if groups is None:
+        st.info("⬅️ Jalankan sortir dulu di tab **📤 Sortir Resi**, lalu kembali ke sini.")
         st.stop()
 
-    mc     = meta.get("method_counts", {})
-    labels = {
-        "text": "📄 Text",
-        "ocr":  "🔍 OCR",
-        "groq": "🤖 Groq",
-        "none": "❓ Tidak terdeteksi",
-    }
-    parts  = [f"{labels.get(m, m)}: **{n}**" for m, n in mc.items() if n > 0]
-    if parts:
-        st.caption("Metode deteksi: " + " · ".join(parts))
+    # Settings dari sidebar
+    tgl_dt       = datetime.combine(tgl_kloteran, datetime.min.time())
+    tgl_display  = tgl_dt.strftime("%d %B %Y")
+    hari_parity  = "Ganjil → 1,2,3" if tgl_dt.day % 2 == 1 else "Genap → A,B,C"
 
-    st.markdown("#### 📊 Ringkasan Hasil Sortir")
-    rows = []
-    for name in sorted(groups.keys()):
-        d        = groups[name]
-        kurir    = d.get("kurir") or "—"
-        produk   = d.get("produk") or "Mixed"
-        total_b  = sum(v for k, v in d["total_per_produk"].items() if k.startswith("_BATANG_"))
-        rows.append({
-            "File PDF":      f"{name}.pdf",
-            "Kurir":         kurir,
-            "Produk / Kategori": produk,
-            "Total Resi":    d["total_resi"],
-            "Total Batang":  total_b,
-        })
-    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-
-    with st.spinner("Menyusun PDF tersortir…"):
-        output_pdfs = build_output_pdfs(pdf_bytes, groups)
-
-    excel_bytes = None
-    if gen_excel:
-        with st.spinner("Membuat rekap Excel…"):
-            try:
-                excel_bytes = build_excel_rekap(groups)
-            except Exception:
-                excel_bytes = None
-                st.warning("⚠️ openpyxl tidak terpasang — ZIP dibuat tanpa Excel.")
-
-    zip_bytes = build_zip(output_pdfs, excel_bytes)
-    timestamp = (datetime.utcnow() + timedelta(hours=7)).strftime("%Y%m%d_%H%M")
-
-    st.success(
-        f"✅ Selesai! **{len(output_pdfs)} PDF** kurir tersortir"
-        + (" + rekap Excel" if excel_bytes else "")
-        + " — siap download."
+    st.caption(
+        f"Tanggal: **{tgl_display}** · Admin: **{nama_admin}** · "
+        f"Penomoran: **{hari_parity}** · "
+        f"Batas single: **{batas_single} resi** · Batas multi: **{batas_multi} resi**"
     )
 
-    st.download_button(
-        label=f"⬇️ Download sortir_resi_{timestamp}.zip",
-        data=zip_bytes,
-        file_name=f"sortir_resi_{timestamp}.zip",
-        mime="application/zip",
-        type="primary",
-        use_container_width=True,
+    # Auto-assign kloteran
+    kloterans = assign_kloteran(
+        groups,
+        tanggal=tgl_dt,
+        batas_single=batas_single,
+        batas_multi=batas_multi,
     )
 
-    with st.expander("📋 Detail per kurir / kategori"):
-        for name in sorted(groups.keys()):
-            d = groups[name]
-            st.markdown(f"**{name}** — {d['total_resi']} resi")
-            detail = [
-                {
-                    "Produk": prod,
-                    "Jumlah Resi": n,
-                    "Total Batang": d["total_per_produk"].get(f"_BATANG_{prod}", n),
-                }
-                for prod, n in sorted(d["total_per_produk"].items())
-                if not prod.startswith("_BATANG_")
-            ]
-            if detail:
-                st.dataframe(pd.DataFrame(detail), hide_index=True, use_container_width=True)
+    if not kloterans:
+        st.warning("Tidak ada data kloteran. Pastikan sortir sudah dijalankan.")
+        st.stop()
+
+    # ── Preview tabel interaktif ──
+    st.markdown(f"**Total: {len(kloterans)} kloteran · {sum(k['jumlah_resi'] for k in kloterans)} resi**")
+
+    # Edit table — user bisa adjust produk/kurir kalau mau
+    df_kl = pd.DataFrame([{
+        "Kloteran":    kl["label"],
+        "Kurir":       kl["kurir"],
+        "Produk":      kl["produk_display"],
+        "Jml Resi":    kl["jumlah_resi"],
+        "Tipe":        "Multi" if kl["is_multi"] else "Single",
+    } for kl in kloterans])
+
+    st.dataframe(df_kl, hide_index=True, use_container_width=True)
+
+    st.divider()
+
+    # ── Generate output ──
+    col_e, col_p = st.columns(2)
+
+    with col_e:
+        if st.button("📊 Generate Excel Kloteran", use_container_width=True, key="btn_kl_excel"):
+            with st.spinner("Membuat Excel kloteran…"):
+                try:
+                    xl_bytes = build_kloteran_excel(kloterans, tgl_dt, nama_admin)
+                    fname    = f"kloteran_{tgl_dt.strftime('%Y%m%d')}_{nama_admin}.xlsx"
+                    st.download_button(
+                        label=f"⬇️ Download {fname}",
+                        data=xl_bytes,
+                        file_name=fname,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        type="primary",
+                        use_container_width=True,
+                        key="dl_kl_excel",
+                    )
+                except Exception as ex:
+                    st.error(f"❌ Gagal buat Excel: {ex}")
+
+    with col_p:
+        if st.button("🖨️ Generate Print Sheet", use_container_width=True, key="btn_kl_pdf"):
+            with st.spinner("Membuat print sheet…"):
+                try:
+                    out_bytes, out_type = build_kloteran_pdf(kloterans, tgl_dt, nama_admin)
+                    if out_type == "pdf":
+                        fname = f"kloteran_{tgl_dt.strftime('%Y%m%d')}_{nama_admin}.pdf"
+                        mime  = "application/pdf"
+                        label = f"⬇️ Download {fname}"
+                    else:
+                        fname = f"kloteran_{tgl_dt.strftime('%Y%m%d')}_{nama_admin}.html"
+                        mime  = "text/html"
+                        label = "⬇️ Download Print Sheet (HTML — buka lalu Ctrl+P)"
+                    st.download_button(
+                        label=label,
+                        data=out_bytes,
+                        file_name=fname,
+                        mime=mime,
+                        type="primary",
+                        use_container_width=True,
+                        key="dl_kl_pdf",
+                    )
+                    if out_type == "html":
+                        st.caption(
+                            "ℹ️ WeasyPrint tidak terpasang — download HTML, "
+                            "buka di browser, lalu Ctrl+P untuk print/save PDF."
+                        )
+                except Exception as ex:
+                    st.error(f"❌ Gagal buat print sheet: {ex}")
+
+    st.divider()
+
+    # ── Detail kloteran expand ──
+    with st.expander("🔍 Detail per kloteran"):
+        for kl in kloterans:
+            is_m    = kl["is_multi"]
+            tipe    = "Multi" if is_m else "Single"
+            produk  = kl["produk_display"]
+            st.markdown(
+                f"**Kloteran {kl['label']}** — {kl['kurir']} — {tipe} — "
+                f"{kl['jumlah_resi']} resi\n\n"
+                f"> Produk: {produk}"
+            )
             st.markdown("---")
