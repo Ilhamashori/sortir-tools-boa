@@ -952,6 +952,71 @@ def assign_kloteran(
     return kloterans
 
 
+def merge_kloteran(kloterans: list[dict], indices: list[int]) -> list[dict]:
+    """
+    Gabung kloteran pada posisi `indices` jadi 1 kloteran baru.
+    Kloteran hasil gabungan ditempatkan di posisi pertama dari indices.
+    """
+    if len(indices) < 2:
+        return kloterans
+
+    indices_set = set(indices)
+    to_merge    = [kloterans[i] for i in sorted(indices)]
+
+    merged_produk_qty:    dict[str, int] = {}
+    merged_companion_qty: dict[str, int] = {}
+    merged_pages:         list[int]      = []
+    merged_resi = 0
+
+    for kl in to_merge:
+        merged_pages.extend(kl.get("page_indices", []))
+        merged_resi += kl["jumlah_resi"]
+        for p, n in kl.get("produk_qty", {}).items():
+            merged_produk_qty[p] = merged_produk_qty.get(p, 0) + n
+        for c, n in kl.get("companion_qty", {}).items():
+            merged_companion_qty[c] = merged_companion_qty.get(c, 0) + n
+
+    label       = "+".join(kl["label"] for kl in to_merge)
+    kurir       = to_merge[0]["kurir"]
+    produk_list = list(merged_produk_qty.keys())
+    is_multi    = (
+        len({re.sub(r"\s*\d+\s*pcs\s*$", "", p, flags=re.IGNORECASE).strip()
+             for p in merged_produk_qty}) > 1
+        or any(kl["is_multi"] for kl in to_merge)
+    )
+    produk_display = (
+        " / ".join(produk_list) if is_multi
+        else (produk_list[0] if produk_list else "—")
+    )
+
+    merged = {
+        "nomor":          to_merge[0]["nomor"],
+        "label":          label,
+        "kurir":          kurir,
+        "is_multi":       is_multi,
+        "produk_list":    produk_list,
+        "produk_display": produk_display,
+        "produk_qty":     merged_produk_qty,
+        "companion_qty":  merged_companion_qty,
+        "jumlah_resi":    merged_resi,
+        "total_pcs":      sum(merged_produk_qty.values()),
+        "group_key":      "merged",
+        "page_indices":   merged_pages,
+    }
+
+    # Susun ulang: merged masuk di posisi pertama, sisanya tetap urut
+    result: list[dict] = []
+    inserted = False
+    for i, kl in enumerate(kloterans):
+        if i in indices_set:
+            if not inserted:
+                result.append(merged)
+                inserted = True
+        else:
+            result.append(kl)
+    return result
+
+
 # ══════════════════════════════════════════════════════════════
 #  BUILD KLOTERAN EXCEL
 # ══════════════════════════════════════════════════════════════
@@ -1787,34 +1852,86 @@ with tab_kloteran:
         f"Batas single: **{batas_single} resi** · Batas multi: **{batas_multi} resi**"
     )
 
-    kloterans = assign_kloteran(
+    # Hitung kloteran awal (fresh dari assign_kloteran)
+    kloterans_awal = assign_kloteran(
         groups, tanggal=tgl_dt,
         batas_single=batas_single, batas_multi=batas_multi,
     )
 
-    if not kloterans:
+    if not kloterans_awal:
         st.warning("Tidak ada data kloteran. Pastikan sortir sudah dijalankan.")
         st.stop()
 
+    # ── Session state: working kloterans (bisa diedit/digabung) ──
+    # Reset kalau upload baru atau parameter berubah
+    _kl_params = (id(groups), batas_single, batas_multi, tgl_dt.date())
+    if st.session_state.get("_kl_params") != _kl_params:
+        st.session_state["kloterans_working"] = kloterans_awal
+        st.session_state["_kl_params"]        = _kl_params
+
+    kloterans = st.session_state["kloterans_working"]
+
     # ── Summary chips ──
     total_resi_kl = sum(k["jumlah_resi"] for k in kloterans)
-    total_pcs_kl  = sum(k.get("total_pcs", 0) for k in kloterans)
     col_s1, col_s2, col_s3, col_s4 = st.columns(4)
     col_s1.metric("Total Kloteran", len(kloterans))
-    col_s2.metric("Total Resi", total_resi_kl)
+    col_s2.metric("Total Resi",     total_resi_kl)
     col_s3.metric("Single", sum(1 for k in kloterans if not k["is_multi"]))
-    col_s4.metric("Multi", sum(1 for k in kloterans if k["is_multi"]))
+    col_s4.metric("Multi",  sum(1 for k in kloterans if k["is_multi"]))
 
-    # ── Tabel preview ──
+    # ── Tabel dengan checkbox Pilih ──
     df_kl = pd.DataFrame([{
+        "Pilih":     False,
         "Kloteran":  kl["label"],
         "Kurir":     kl["kurir"],
         "Produk":    kl["produk_display"],
         "Jml Resi":  kl["jumlah_resi"],
-        "Total PCS": kl.get("total_pcs", "—"),
+        "Total PCS": kl.get("total_pcs", 0),
         "Tipe":      "Multi" if kl["is_multi"] else "Single",
     } for kl in kloterans])
-    st.dataframe(df_kl, hide_index=True, use_container_width=True)
+
+    edited_df = st.data_editor(
+        df_kl,
+        column_config={
+            "Pilih":     st.column_config.CheckboxColumn("☑", width="small"),
+            "Kloteran":  st.column_config.TextColumn("Kloteran", width="small"),
+            "Tipe":      st.column_config.TextColumn("Tipe", width="small"),
+        },
+        disabled=["Kloteran", "Kurir", "Produk", "Jml Resi", "Total PCS", "Tipe"],
+        hide_index=True,
+        use_container_width=True,
+        key="kl_table_editor",
+    )
+
+    # ── Gabung UI ──
+    selected_indices = [int(i) for i, row in edited_df.iterrows() if row["Pilih"]]
+    n_sel = len(selected_indices)
+
+    col_info, col_reset = st.columns([4, 1])
+    with col_info:
+        if n_sel >= 2:
+            sel_labels = " + ".join(kloterans[i]["label"] for i in selected_indices)
+            st.caption(f"✅ **{n_sel} kloteran dipilih:** {sel_labels} — siap digabung")
+        elif n_sel == 1:
+            st.caption("☝️ Pilih minimal 2 kloteran untuk digabung.")
+        else:
+            st.caption("☑️ Centang 2 atau lebih baris di tabel untuk menggabungkan kloteran.")
+    with col_reset:
+        if st.button("🔁 Reset", use_container_width=True, key="btn_kl_reset",
+                     help="Kembalikan ke kloteran awal sebelum ada penggabungan"):
+            st.session_state["kloterans_working"] = kloterans_awal
+            st.rerun()
+
+    if n_sel >= 2:
+        sel_labels = " + ".join(kloterans[i]["label"] for i in selected_indices)
+        if st.button(
+            f"🔗 Gabung: {sel_labels}",
+            type="primary",
+            use_container_width=True,
+            key="btn_gabung",
+        ):
+            st.session_state["kloterans_working"] = merge_kloteran(kloterans, selected_indices)
+            st.rerun()
 
     st.divider()
     st.markdown("##### 📥 Download Output")
@@ -1848,21 +1965,16 @@ with tab_kloteran:
                         kloterans, tgl_dt, nama_admin
                     )
                     if out_type == "pdf":
-                        fname = f"printsheet_{tgl_dt.strftime('%Y%m%d')}_{nama_admin}.pdf"
-                        mime  = "application/pdf"
+                        fname     = f"printsheet_{tgl_dt.strftime('%Y%m%d')}_{nama_admin}.pdf"
+                        mime      = "application/pdf"
                         btn_label = f"⬇️ Download {fname}"
                     else:
-                        fname = f"printsheet_{tgl_dt.strftime('%Y%m%d')}_{nama_admin}.html"
-                        mime  = "text/html"
+                        fname     = f"printsheet_{tgl_dt.strftime('%Y%m%d')}_{nama_admin}.html"
+                        mime      = "text/html"
                         btn_label = "⬇️ Download Print Sheet (HTML)"
                     st.download_button(
-                        label=btn_label,
-                        data=out_bytes,
-                        file_name=fname,
-                        mime=mime,
-                        type="primary",
-                        use_container_width=True,
-                        key="dl_kl_pdf",
+                        label=btn_label, data=out_bytes, file_name=fname, mime=mime,
+                        type="primary", use_container_width=True, key="dl_kl_pdf",
                     )
                     if out_type == "html":
                         st.caption(
@@ -1878,8 +1990,7 @@ with tab_kloteran:
         "📦 PDF Resi per Kloteran (ZIP)",
         use_container_width=True,
         key="btn_kl_zip",
-        help="Buat ZIP berisi PDF resi asli yang sudah dipotong sesuai kloteran. "
-             "Tiap file = 1 kloteran, packer tinggal buka PDF-nya.",
+        help="Buat ZIP berisi PDF resi asli yang sudah dipotong sesuai kloteran.",
     ):
         if pdf_bytes is None:
             st.error("❌ PDF resi asli tidak ditemukan. Upload ulang di tab Sortir Resi.")
@@ -1890,16 +2001,12 @@ with tab_kloteran:
                     fname  = f"resi_kloteran_{tgl_dt.strftime('%Y%m%d')}_{nama_admin}.zip"
                     st.download_button(
                         label=f"⬇️ Download {fname}",
-                        data=zip_kl,
-                        file_name=fname,
-                        mime="application/zip",
-                        type="primary",
-                        use_container_width=True,
-                        key="dl_kl_zip",
+                        data=zip_kl, file_name=fname, mime="application/zip",
+                        type="primary", use_container_width=True, key="dl_kl_zip",
                     )
                     st.caption(
                         f"ZIP berisi {len(kloterans)} file PDF — "
-                        "nama file: Kloteran_{{label}}_{{kurir}}_{{produk}}.pdf"
+                        "nama file: Kloteran_{label}_{kurir}_{produk}.pdf"
                     )
                 except Exception as ex:
                     st.error(f"❌ Gagal buat ZIP: {ex}")
