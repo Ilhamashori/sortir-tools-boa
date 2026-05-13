@@ -390,60 +390,203 @@ def _groq_detect_kurir(png_bytes: bytes, api_key: str | None = None) -> str | No
 #  PARSE PRODUK
 # ══════════════════════════════════════════════════════════════
 
+# ── SKU / keyword produk yg harus diabaikan (free gift, packing) ──────────────
+# Kalau SKU utama dari merchant table masuk list ini → parse_produk return {}
+# Kalau teks label mengandung baris free-gift → baris itu di-strip dulu
+_IGNORE_SKU_EXACT: set[str] = {
+    "BUBBLE01",
+    "0101ASRT",                                   # amplop lebaran
+    "0505PHAROS", "0505MAGIA", "0505ABROWIE",
+    "0505SPEXSYMBOL", "0505LAUSHINE", "0505LANIER",
+    "0505Brow&Lash",
+}
+
+# Regex prefix 0505 (catch kolaborasi baru yg belum ada di list di atas)
+_IGNORE_SKU_PREFIX_RE = re.compile(r"^0505", re.IGNORECASE)
+
+# Keyword di JUDUL BARIS yg menandakan baris itu adalah free-gift → dibuang dari teks
+# sebelum PRODUK_PATTERNS di-scan
+_IGNORE_LINE_RE = re.compile(
+    r"product\s+grtis|free\s+(?:gift|rndom)|"
+    r"bubble\s+wrap|bubble\s+packing|plastik.{0,10}packing|"
+    r"amplop\s+lebaran|colabora(?:si|tion)|exclusive\s+gift",
+    re.IGNORECASE,
+)
+
+# ── Text patterns → nama produk (urutan penting: spesifik dulu) ──────────────
 PRODUK_PATTERNS = [
-    (r"glow\s*soap",             "Glow Soap"),
-    (r"brightening\s*serum",     "Brightening Serum"),
-    (r"moist\s*serum",           "Moist Serum"),
-    (r"acne\s*serum",            "Acne Serum"),
-    (r"body\s*lotion\s*sachet",  "Body Lotion Sachet"),
-    (r"body\s*lotion",           "Body Lotion"),
-    (r"body\s*wash",             "Body Wash"),
-    (r"lip\s*serum",             "Lip Serum"),
-    (r"eye\s*cream",             "Eye Cream"),
-    (r"underarm",                "Underarm"),
-    (r"feminine\s*spray",        "Feminine Spray"),
-    (r"men\s*care",              "Men Care"),
-    (r"sunscreen",               "Sunscreen"),
-    (r"peeling\s*serum",         "Peeling Serum"),
-    (r"parfume?",                "Parfume"),
-    (r"toner",                   "Toner"),
-    (r"build\s*your\s*chapter",  "Build Your Chapter"),
-    (r"collagen\s*drink",        "Collagen Drink"),
-    (r"day\s*cream",             "Day Cream"),
-    (r"night\s*gel",             "Night Gel"),
-    (r"facial\s*wash",           "Facial Wash"),
-    (r"meili",                   "Meili Beauty Cream"),
-    (r"beauty\s*of\s*angel",     "BOA Produk"),
+    # Soap / Lotion Sachet — deteksi sebelum kata generik
+    (r"glow\s*soap",                    "Glow Soap"),
+    (r"body\s*lotion\s*sachet",         "Body Lotion Sachet"),
+
+    # Serum spesifik — sebelum generic 'serum'
+    (r"brightening\s*serum",            "Brightening Serum"),
+    (r"brightening\s*advance",          "Brightening Serum"),   # varian judul lain
+    (r"acne\s*serum",                   "Acne Serum"),
+    (r"peeling\s*(?:serum|advance|solution)", "Peeling Serum"),
+    (r"moisturi[sz]er\s*serum",         "Moisturizer Serum"),   # fix: pola lama moist\s*serum tdk cocok
+    (r"moisturizer",                    "Moisturizer Serum"),   # fallback jika tanpa kata serum
+
+    # Body care
+    (r"body\s*lotion",                  "Body Lotion"),
+    (r"body\s*wash",                    "Body Wash"),
+
+    # Lip & Eye
+    (r"lip\s*serum",                    "Lip Serum"),
+    (r"eye\s*cre?am",                   "Eye Cream"),
+    (r"eye\s*wrin[kl]",                 "Eye Wrinkle"),         # Eye Wrinkel / Eye Wrinkle
+
+    # Underarm
+    (r"underarm",                       "Underarm"),
+
+    # Feminine (spray & nature)
+    (r"feminin",                        "Feminine"),            # cocok: Feminine Spray, Nature Feminine
+
+    # Sunscreen
+    (r"sunscreen",                      "Sunscreen"),
+
+    # White Tomato Series — sebelum 'facial wash' / 'day cream' dst agar tidak pecah
+    (r"white\s*tomato",                 "White Tomato Series"),
+    (r"\bwt\s+(?:series|brightening|sunscreen|day|night|facial|toner)\b", "White Tomato Series"),
+
+    # Parfume BYC (by Umar Wijaya / kolaborasi)
+    (r"\bbyc\b",                        "Parfume BYC"),
+
+    # Parfume BOA (extrait / individual variant)
+    (r"extrait\s*de\s*parfum",          "Parfume"),
+    (r"parfum[e]?",                     "Parfume"),
+
+    # WT sub-products (hanya jika WT Series belum ke-match)
+    (r"face\s*toner|brightening\s*toner", "Toner"),
+    (r"facial\s*wash",                  "Facial Wash"),
+    (r"day\s*cream",                    "Day Cream"),
+    (r"night\s*gel",                    "Night Gel"),
+
+    # Collagen Drink — sebelum 'drink' saja
+    (r"collagen\s*drink",               "Collagen Drink"),
+    (r"collagen\s+(?:gluthatione|glutathione)", "Collagen Drink"),  # judul tanpa kata 'drink'
+
+    # Cleansing Balm
+    (r"cleansing\s*balm",               "Cleansing Balm"),
+
+    # Catch-all BOA (dihapus di post-processing, tapi berguna sbg fallback)
+    (r"beauty\s*of\s*angel",            "BOA Produk"),
 ]
 
+# ── SKU → nama produk (dibangun dari data BigSeller nyata) ───────────────────
+# Urutan penting: pola lebih spesifik/panjang DULU sebelum pola generik
 _SKU_TO_PRODUK = [
-    (r"0208.BLTS",   "Body Lotion Sachet"),
-    (r"0208.BLT",    "Body Lotion"),
-    (r"0310.MLP",    "Lip Serum"),
-    (r"0208.USN",    "Underarm"),
-    (r"0208.GSP",    "Glow Soap"),
-    (r"0208.SRG",    "Serum Glow"),
-    (r"0208.EC",     "Eye Cream"),
-    (r"0208.FS",     "Feminine Spray"),
-    (r"0208.MC",     "Men Care"),
-    (r"0208.SSN",    "Sunscreen"),
-    (r"0208.PS",     "Peeling Serum"),
-    (r"0208.PRF",    "Parfume"),
-    (r"0208.TNR",    "Toner"),
-    (r"0208.BYC",    "Build Your Chapter"),
-    (r"0208.CLD",    "Collagen Drink"),
-    (r"0208.DC",     "Day Cream"),
-    (r"0208.NG",     "Night Gel"),
-    (r"0208.FW",     "Facial Wash"),
-    (r"0208.MLB",    "Meili Beauty Cream"),
+    # ── Lip Serum (0310) ────────────────────────────────────────────────────
+    (r"^0310[A-Z]?MLP",                 "Lip Serum"),       # 0310AMLP, 0310BMLP, dst
+    (r"^0310MLPEWC",                    "Lip Serum"),       # bundle LP + Eye Wrinkle
+
+    # ── Glow Soap (0104) ────────────────────────────────────────────────────
+    (r"^0104[A-Z0-9-]*GSR",             "Glow Soap"),       # semua varian GSR
+    (r"^0104SPONS",                     "Glow Soap"),       # 4 PCS Lebih Hemat
+    (r"^0207ABWPC$",                    "Glow Soap"),       # listing glow soap dgn prefix 0207
+
+    # ── Brightening Serum (0105) ─────────────────────────────────────────────
+    (r"^0105[A-Z]+BTS",                 "Brightening Serum"),
+
+    # ── Peeling Serum / Solution (0105) ──────────────────────────────────────
+    (r"^0105[A-Z]+APS|^0105[A-Z]+PS\b", "Peeling Serum"),
+
+    # ── Moisturizer Serum (0105) ──────────────────────────────────────────────
+    (r"^0105[A-Z]+MOIS",                "Moisturizer Serum"),
+
+    # ── Acne Serum (0105) ────────────────────────────────────────────────────
+    (r"^0105[A-Z]+CCS",                 "Acne Serum"),
+
+    # ── Eye Cream (0202 …EYC) ────────────────────────────────────────────────
+    (r"^0202[A-Z]+EYC",                 "Eye Cream"),
+
+    # ── Eye Wrinkle (0202 …EWC) ──────────────────────────────────────────────
+    (r"^0202[A-Z]+EWC",                 "Eye Wrinkle"),
+
+    # ── Body Lotion Sachet — HARUS sebelum Body Lotion ──────────────────────
+    (r"^0208[A-Z]+BLTS",                "Body Lotion Sachet"),
+    (r"^0208FABLES",                    "Body Lotion Sachet"),  # 1pcs lotion + 5 sachet
+
+    # ── Body Lotion (0208 …BLT) ──────────────────────────────────────────────
+    (r"^0208[A-Z]+BLT",                 "Body Lotion"),
+
+    # ── Body Wash (0207) ─────────────────────────────────────────────────────
+    (r"^0207[A-Z0-9]+BWP",              "Body Wash"),
+    (r"^0207[A-Z0-9]+BWC",              "Body Wash"),
+    (r"^0207BBWCDS",                    "Body Wash"),
+
+    # ── Underarm (0208 …AU / BUC / CUC / BUS) ───────────────────────────────
+    (r"^0208[A-Z0-9-]*(AUC|AUCN|AUS|AUSN|BUCNS?A?|CUCN|BUCNG|BUSN)",
+                                        "Underarm"),
+
+    # ── Sunscreen ────────────────────────────────────────────────────────────
+    (r"^0101[A-Z]SSC",                  "Sunscreen"),
+    (r"^0101[A-Z]SPF",                  "Sunscreen"),
+    (r"^0203[A-Z]SPF",                  "Sunscreen"),          # paket WT sunscreen
+
+    # ── White Tomato Series ──────────────────────────────────────────────────
+    (r"^0100[A-Z]+WT",                  "White Tomato Series"),
+    (r"^0101[A-Z]+WT",                  "White Tomato Series"),
+    (r"^0104[A-Z]+WT",                  "White Tomato Series"),
+    (r"^0203[A-Z]+WT",                  "White Tomato Series"),
+
+    # ── Parfume BYC ──────────────────────────────────────────────────────────
+    (r"^0209[A-Z0-9-]*BYC",             "Parfume BYC"),
+    (r"^0209EBYC",                      "Parfume BYC"),
+
+    # ── Parfume BOA (individual & bundle) ────────────────────────────────────
+    (r"^0209[A-Z]+P(BT|DM|FL|EP)",      "Parfume"),   # single: Butter/Dynamite/FirstLove/Euphoria
+    (r"^0209[A-Z]+PDM",                 "Parfume"),   # 0209BPDM-1 dst
+    (r"^0209[A-Z]+BB(TDM|TEP|TFL)",     "Parfume"),   # bundle 2 parfume BOA
+    (r"^0209[A-Z]+BD(MEP|MFL)",         "Parfume"),   # bundle Dynamite + …
+    (r"^0209[A-Z]+BFL(EP)?",            "Parfume"),
+    (r"^0209[A-Z0-9]+(CPB|CPD|CPF|DPB|DPD|DPF|DPE|BPB|BPD|BPF)", "Parfume"),
+    (r"^0290",                          "Parfume"),   # 0290BPEP, 0290CPEP, 0290DPEP
+
+    # ── Feminine ─────────────────────────────────────────────────────────────
+    (r"^0209[A-Z]+NFN",                 "Feminine"),
+    (r"^0209[A-Z]+FSP",                 "Feminine"),
+
+    # ── Collagen Drink (0412) ────────────────────────────────────────────────
+    (r"^0412[A-Z0-9-]+CDM",             "Collagen Drink"),
+
+    # ── Cleansing Balm ───────────────────────────────────────────────────────
+    (r"^0106ACSB",                      "Cleansing Balm"),
+
+    # ── Men Care ─────────────────────────────────────────────────────────────
+    (r"^0213AMCR",                      "Men Care"),
+    (r"^MENCARE$",                       "Men Care"),
+
+    # ── Toner ────────────────────────────────────────────────────────────────
+    (r"^0203[A-Z]+TNR",                 "Toner"),
 ]
+
+
+def _is_ignore_sku(sku_code: str) -> bool:
+    """Return True jika SKU adalah free-gift / packing yg harus diabaikan."""
+    sku_up = sku_code.strip().upper()
+    if sku_up in {s.upper() for s in _IGNORE_SKU_EXACT}:
+        return True
+    if _IGNORE_SKU_PREFIX_RE.match(sku_code.strip()):
+        return True
+    return False
 
 
 def _sku_to_produk_name(sku_code: str) -> str | None:
+    """Return nama produk dari SKU, atau None kalau tidak dikenal / harus diabaikan."""
+    if _is_ignore_sku(sku_code):
+        return None
     for pattern, nama in _SKU_TO_PRODUK:
         if re.search(pattern, sku_code, re.IGNORECASE):
             return nama
     return None
+
+
+def _strip_ignore_lines(text: str) -> str:
+    """Buang baris yg mengandung keyword free-gift agar tidak ikut dideteksi sebagai produk."""
+    lines = text.split("\n")
+    cleaned = [ln for ln in lines if not _IGNORE_LINE_RE.search(ln)]
+    return "\n".join(cleaned)
 
 
 def _parse_merchant_table(text_clean: str) -> tuple:
@@ -458,9 +601,15 @@ def _parse_merchant_table(text_clean: str) -> tuple:
         line = line.strip()
         if not line or re.search(r"qty\s+total", line, re.IGNORECASE):
             continue
-        m = re.search(r"^(.+?)\s+\b([A-Z0-9]{6,})\s+(\d+)\s*$", line)
+        # Skip baris free-gift dalam merchant table
+        if _IGNORE_LINE_RE.search(line):
+            continue
+        m = re.search(r"^(.+?)\s+\b([A-Z0-9]{6,}[-A-Z0-9]*)\s+(\d+)\s*$", line)
         if m:
-            return m.group(1).strip(), m.group(2).strip(), int(m.group(3))
+            sku = m.group(2).strip()
+            if _is_ignore_sku(sku):
+                continue
+            return m.group(1).strip(), sku, int(m.group(3))
     return None, None, None
 
 
@@ -482,9 +631,10 @@ def parse_produk(text: str) -> dict:
             key = f"{sku_produk} {qty} PCS" if qty > 1 else sku_produk
             return {key: 1}
 
-    search_text = text_clean
+    # Buang baris free-gift sebelum text-scan
+    search_text = _strip_ignore_lines(text_clean)
     if merch_title:
-        search_text = text_clean + "\n" + merch_title
+        search_text = search_text + "\n" + merch_title
 
     barang_m = re.search(r"Barang\s*:\s*(.+?)(?:\n|$)", text_clean, re.IGNORECASE)
 
@@ -505,9 +655,9 @@ def parse_produk(text: str) -> dict:
             m_qty = re.search(r"(\d+)\s*PC[SO]+", barang_m.group(1), re.IGNORECASE)
             qty = int(m_qty.group(1)) if m_qty else 1
         else:
-            all_matches = list(re.finditer(pat, text_clean, re.IGNORECASE))
+            all_matches = list(re.finditer(pat, search_text, re.IGNORECASE))
             last_m = all_matches[-1]
-            window = text_clean[max(0, last_m.start() - 40): last_m.end() + 60]
+            window = search_text[max(0, last_m.start() - 40): last_m.end() + 60]
             m_qty = re.search(r"(\d+)\s*PC[SO]+", window, re.IGNORECASE)
             qty = int(m_qty.group(1)) if m_qty else 1
 
@@ -523,6 +673,49 @@ def parse_produk(text: str) -> dict:
         boa_keys = [k for k in list(hasil) if k == "BOA Produk" or k.startswith("BOA Produk ")]
         for k in boa_keys:
             del hasil[k]
+    return hasil
+
+
+# ── Companion products: gratis dari segi harga, tapi tetap dipacking ────────
+# Key = SKU exact (uppercase), Value = nama produk
+_COMPANION_SKUS: dict[str, str] = {
+    "0213AMCR": "Men Care",
+    "MENCARE":  "Men Care",
+}
+
+
+def parse_companion_produk(text: str) -> dict:
+    """
+    Deteksi produk companion (free gift tapi real produk) dari teks resi.
+    Return dict {nama_produk: total_qty}, terpisah dari produk utama.
+    Tidak mempengaruhi grouping/sortir — hanya untuk rekap packing.
+    """
+    if not text:
+        return {}
+
+    text_clean = re.sub(r"(?:Pengirim|Sender)\s*[:\(][^\n]*\n?", "", text, flags=re.IGNORECASE)
+    merch_m = re.search(
+        r"Merchant\s+Title\s+SKU\s+Qty(.+)",
+        text_clean, re.DOTALL | re.IGNORECASE,
+    )
+    if not merch_m:
+        return {}
+
+    hasil: dict[str, int] = {}
+    section = merch_m.group(1)
+    comp_upper = {k.upper(): v for k, v in _COMPANION_SKUS.items()}
+
+    for line in section.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        m = re.search(r"^(.+?)\s+\b([A-Z0-9]{6,}[-A-Z0-9]*)\s+(\d+)\s*$", line)
+        if m:
+            sku = m.group(2).strip().upper()
+            if sku in comp_upper:
+                nama = comp_upper[sku]
+                hasil[nama] = hasil.get(nama, 0) + int(m.group(3))
+
     return hasil
 
 
@@ -609,29 +802,32 @@ def _kurir_slug(kurir: str) -> str:
 
 # Nama singkatan produk untuk print sheet kloteran
 _PRODUK_SINGKAT = {
-    "Body Lotion":        "Body Lotion",
-    "Body Lotion Sachet": "BL Sachet",
-    "Lip Serum":          "Lip Serum",
-    "Glow Soap":          "Glow Soap",
-    "Eye Cream":          "Eye Cream",
-    "Underarm":           "Underarm",
-    "Feminine Spray":     "Fem Spray",
-    "Men Care":           "Men Care",
-    "Sunscreen":          "Sunscreen",
-    "Peeling Serum":      "Peeling Serum",
-    "Parfume":            "Parfume",
-    "Toner":              "Toner",
-    "Build Your Chapter": "Build YC",
-    "Collagen Drink":     "Collagen",
-    "Day Cream":          "Day Cream",
-    "Night Gel":          "Night Gel",
-    "Facial Wash":        "Facial Wash",
-    "Meili Beauty Cream": "Meili",
-    "Brightening Serum":  "Bright Serum",
-    "Moist Serum":        "Moist Serum",
-    "Acne Serum":         "Acne Serum",
-    "Serum Glow":         "Serum Glow",
-    "Body Wash":          "Body Wash",
+    "Body Lotion":          "Body Lotion",
+    "Body Lotion Sachet":   "BL Sachet",
+    "Body Wash":            "Body Wash",
+    "Lip Serum":            "Lip Serum",
+    "Eye Cream":            "Eye Cream",
+    "Eye Wrinkle":          "Eye Wrinkle",
+    "Underarm":             "Underarm",
+    "Feminine":             "Feminine",
+    "Feminine Spray":       "Fem Spray",
+    "Men Care":             "Men Care",
+    "Sunscreen":            "Sunscreen",
+    "Glow Soap":            "Glow Soap",
+    "Brightening Serum":    "Bright Serum",
+    "Peeling Serum":        "Peeling",
+    "Moisturizer Serum":    "Moisturizer",
+    "Acne Serum":           "Acne Serum",
+    "Parfume":              "Parfume",
+    "Parfume BYC":          "BYC",
+    "Collagen Drink":       "Collagen",
+    "White Tomato Series":  "WT Series",
+    "Toner":                "Toner",
+    "Facial Wash":          "Facial Wash",
+    "Day Cream":            "Day Cream",
+    "Night Gel":            "Night Gel",
+    "Cleansing Balm":       "Cleansing Balm",
+    "Meili Beauty Cream":   "Meili",
 }
 
 
@@ -708,17 +904,26 @@ def assign_kloteran(
             chunk_idx = [idx for idx, _ in chunk]
 
             # Hitung qty per produk dalam chunk ini
-            # produk_qty: {nama_singkat_dengan_pcs: total_pcs}
             produk_qty: dict[str, int] = {}
             for _, parse_result in chunk:
                 for nama, _ in parse_result.items():
                     short = _singkat_produk(nama)
-                    # qty pcs per item (dari suffix PCS di nama)
                     m_pcs = re.search(r"(\d+)\s*PCS", nama, re.IGNORECASE)
                     pcs_per_resi = int(m_pcs.group(1)) if m_pcs else 1
                     produk_qty[short] = produk_qty.get(short, 0) + pcs_per_resi
 
-            # produk_list: urutan unik produk di chunk ini
+            # Hitung companion per chunk (proporsional dari total group)
+            # companion_per_produk di-store di group, bukan per-page
+            # → estimasi: total_companion / total_resi_group * jumlah_resi_chunk
+            companion_qty: dict[str, int] = {}
+            total_resi_group = d["total_resi"]
+            for comp_nama, comp_total in d.get("companion_per_produk", {}).items():
+                if total_resi_group > 0:
+                    # round untuk chunk terakhir — pakai round agar total tepat
+                    estimated = round(comp_total * len(chunk_idx) / total_resi_group)
+                    if estimated > 0:
+                        companion_qty[comp_nama] = estimated
+
             produk_list = list(produk_qty.keys())
             total_pcs   = sum(produk_qty.values())
 
@@ -736,6 +941,7 @@ def assign_kloteran(
                 "produk_list":    produk_list,
                 "produk_display": produk_display,
                 "produk_qty":     produk_qty,
+                "companion_qty":  companion_qty,   # {nama: qty} — produk gratis real
                 "jumlah_resi":    len(chunk_idx),
                 "total_pcs":      total_pcs,
                 "group_key":      gkey,
@@ -799,7 +1005,14 @@ def build_kloteran_excel(
     # Data rows
     for i, kl in enumerate(kloterans, start=4):
         is_m  = kl["is_multi"]
-        catatan = kl["produk_display"] if is_m else ""
+
+        # Bangun catatan: tampilkan detail produk + companion
+        pq    = kl.get("produk_qty", {})
+        cq    = kl.get("companion_qty", {})
+        detail_parts = [f"{p}: {n} pcs" for p, n in pq.items()]
+        comp_parts   = [f"{p}: {n} pcs (gratis)" for p, n in cq.items()]
+        catatan = "  |  ".join(detail_parts + comp_parts)
+
         produk_cell = kl["produk_display"]
 
         row_data = [
@@ -808,7 +1021,7 @@ def build_kloteran_excel(
             produk_cell,
             kl["jumlah_resi"],
             "Multi" if is_m else "Single",
-            catatan if is_m else "",
+            catatan,
         ]
         for col, val in enumerate(row_data, 1):
             c = ws.cell(row=i, column=col, value=val)
@@ -838,45 +1051,62 @@ def build_kloteran_excel(
 
 def _kartu_html(kl: dict, tgl_str: str, nama_toko: str = "BOA PST") -> str:
     """Render 1 kartu kloteran sebagai HTML — siap digunting."""
-    is_m      = kl["is_multi"]
-    label     = kl["label"]
-    kurir     = kl["kurir"]
-    jml_resi  = kl["jumlah_resi"]
-    produk_qty: dict = kl.get("produk_qty", {})
+    is_m     = kl["is_multi"]
+    label    = kl["label"]
+    kurir    = kl["kurir"]
+    jml_resi = kl["jumlah_resi"]
+    produk_qty: dict   = kl.get("produk_qty", {})
+    companion_qty: dict = kl.get("companion_qty", {})
 
-    # Baris produk: "Lip Serum 2pcs" → "Lip Serum 2pcs · 24 pcs"
-    # Untuk kartu: tampilkan setiap produk + total pcsnya
-    produk_lines = []
+    badge = (
+        '<span class="badge-multi">MULTI</span>' if is_m
+        else '<span class="badge-single">SINGLE</span>'
+    )
+
+    # Baris produk utama
+    prod_rows = ""
     for p_short, total_p in produk_qty.items():
-        produk_lines.append(f"{p_short} &nbsp;·&nbsp; <b>{total_p} pcs</b>")
-
-    produk_html = "<br/>".join(produk_lines) if produk_lines else "—"
-
-    # Badge tipe
-    if is_m:
-        tipe_html = '<span style="background:#C49166;color:#15110D;padding:1px 6px;border-radius:999px;font-size:8px;font-weight:700;">MULTI</span>'
-    else:
-        tipe_html = '<span style="background:#2E251E;color:#C9B89F;padding:1px 6px;border-radius:999px;font-size:8px;">SINGLE</span>'
-
-    total_pcs = kl.get("total_pcs", sum(produk_qty.values()))
+        prod_rows += (
+            f'<div class="pr">'
+            f'<span class="pr-name">{p_short}</span>'
+            f'<span class="pr-qty">{total_p} pcs</span>'
+            f'</div>'
+        )
+    # Companion (gratis tapi real)
+    for c_nama, c_total in companion_qty.items():
+        prod_rows += (
+            f'<div class="pr">'
+            f'<span class="pr-name pr-free">{c_nama}*</span>'
+            f'<span class="pr-qty pr-free">{c_total} pcs</span>'
+            f'</div>'
+        )
+    if not prod_rows:
+        prod_rows = '<div class="pr"><span class="pr-name">—</span></div>'
 
     return f"""
 <div class="kartu">
-  <div class="kartu-top">
-    <div class="toko-tgl">
-      <span class="toko">{nama_toko}</span>
-      <span class="tgl">{tgl_str}</span>
+  <div class="hdr">
+    <div class="hdr-left">
+      <span class="brand">{nama_toko}</span>
+      <span class="knum">{label}</span>
     </div>
-    {tipe_html}
+    <span class="tgl">{tgl_str}</span>
+    <div class="platform"><span>Shopee</span> / <span>TikTok</span></div>
   </div>
-  <div class="kloteran-num">{label}</div>
-  <div class="kurir-row">{kurir}</div>
-  <div class="produk-row">{produk_html}</div>
-  <div class="resi-row">
-    <span>{jml_resi} resi</span>
-    <span class="pcs-total">{total_pcs} pcs total</span>
+  <div class="core">
+    <div class="left-big">
+      <span class="jr-lbl">RESI</span>
+      <span class="jr-num">{jml_resi}</span>
+      <div class="divider-hz"></div>
+      <span class="ex-code">{kurir}</span>
+      <span class="ex-lbl">KURIR</span>
+    </div>
+    <div class="produk-list">{prod_rows}</div>
   </div>
-  <div class="paraf-row">Paraf: ___________</div>
+  <div class="footer">
+    <span class="paraf">Paraf <span class="paraf-line"></span></span>
+    {badge}
+  </div>
 </div>"""
 
 
@@ -929,60 +1159,88 @@ def build_kloteran_print_sheet(
   .chip b {{ color: #A8744E; }}
 
   /* ── Grid kartu ── */
-  .grid {{
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 6px;
-  }}
+  .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }}
 
   /* ── Kartu ── */
   .kartu {{
     border: 1.5px solid #C49166;
     border-radius: 8px;
-    padding: 7px 9px;
+    overflow: hidden;
     background: #fff;
     break-inside: avoid;
     page-break-inside: avoid;
   }}
-  .kartu-top {{
+
+  /* Header baris */
+  .hdr {{
     display: flex; justify-content: space-between; align-items: center;
-    margin-bottom: 3px;
+    padding: 4px 7px; gap: 5px;
+    border-bottom: 0.5px solid #D4B896;
   }}
-  .toko-tgl {{ display: flex; gap: 6px; align-items: center; }}
-  .toko {{ font-weight: 700; font-size: 9px; color: #A8744E; }}
-  .tgl  {{ font-size: 8px; color: #8A7A66; }}
-
-  .kloteran-num {{
-    font-size: 26px; font-weight: 900; color: #C49166;
-    line-height: 1; margin: 2px 0 3px 0; letter-spacing: -0.5px;
+  .hdr-left {{ display: flex; align-items: center; gap: 4px; flex-shrink: 0; }}
+  .brand {{ font-size: 8px; font-weight: 700; color: #A8744E; letter-spacing: .3px; }}
+  .knum {{
+    font-size: 11px; font-weight: 700; color: #15110D;
+    background: #F5EFE6; border: 0.5px solid #D4B896;
+    border-radius: 3px; padding: 0 5px; line-height: 1.5;
   }}
-
-  .kurir-row {{
-    font-size: 10px; font-weight: 700; color: #15110D;
-    background: #F5EFE6; border-radius: 4px;
-    padding: 2px 6px; display: inline-block;
-    margin-bottom: 4px;
+  .tgl {{ font-size: 8px; color: #6B5D4D; white-space: nowrap; }}
+  .platform {{ font-size: 8px; color: #B8A78D; white-space: nowrap; }}
+  .platform span {{
+    padding: 0 4px; border: 0.5px solid #D4B896; border-radius: 3px;
   }}
 
-  .produk-row {{
-    font-size: 9.5px; color: #2E1A0E; line-height: 1.6;
-    border-top: 0.5px dashed #D4B896; padding-top: 3px; margin-bottom: 3px;
-  }}
-  .produk-row b {{ color: #A8744E; }}
+  /* Core: kiri besar + kanan produk */
+  .core {{ display: flex; border-bottom: 0.5px solid #D4B896; }}
 
-  .resi-row {{
-    display: flex; justify-content: space-between;
-    font-size: 9px; color: #6B5D4D;
-    border-top: 0.5px solid #EDE0D0; padding-top: 3px; margin-bottom: 3px;
+  .left-big {{
+    width: 58px; min-width: 58px;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    padding: 8px 0;
+    border-right: 0.5px solid #D4B896;
+    gap: 0;
   }}
-  .pcs-total {{ font-weight: 700; color: #15110D; }}
+  .jr-lbl {{ font-size: 7px; color: #B8A78D; letter-spacing: .4px; margin-bottom: 1px; }}
+  .jr-num {{ font-size: 36px; font-weight: 700; color: #15110D; line-height: 1; }}
+  .divider-hz {{ width: 38px; height: 1px; background: #C49166; margin: 4px 0; }}
+  .ex-code {{ font-size: 18px; font-weight: 700; color: #15110D; line-height: 1; }}
+  .ex-lbl {{ font-size: 7px; color: #B8A78D; letter-spacing: .4px; margin-top: 2px; }}
 
-  .paraf-row {{
-    font-size: 8px; color: #B8A78D;
-    border-top: 0.5px dashed #EDE0D0; padding-top: 3px;
+  .produk-list {{ flex: 1; padding: 5px 7px; display: flex; flex-direction: column; gap: 3px; }}
+  .pr {{
+    display: flex; justify-content: space-between; align-items: baseline;
+    border-bottom: 0.5px dotted #EDE0D0; padding-bottom: 2px;
+  }}
+  .pr:last-child {{ border-bottom: none; padding-bottom: 0; }}
+  .pr-name {{ font-size: 9px; color: #15110D; max-width: 85px; line-height: 1.3; }}
+  .pr-name.pr-free {{ color: #8A7A66; font-style: italic; }}
+  .pr-qty {{ font-size: 10px; font-weight: 700; color: #15110D; white-space: nowrap; }}
+  .pr-qty.pr-free {{ color: #8A7A66; font-weight: 400; }}
+
+  /* Footer */
+  .footer {{
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 4px 7px;
+  }}
+  .paraf {{ font-size: 8px; color: #B8A78D; }}
+  .paraf-line {{
+    display: inline-block; width: 60px; height: 0.5px;
+    background: #C49166; vertical-align: middle; margin-left: 3px;
+  }}
+  .badge-multi {{
+    font-size: 7px; font-weight: 700;
+    padding: 1px 5px; border-radius: 3px;
+    background: #C49166; color: #15110D;
+  }}
+  .badge-single {{
+    font-size: 7px; font-weight: 700;
+    padding: 1px 5px; border-radius: 3px;
+    background: #F5EFE6; color: #A8744E;
+    border: 0.5px solid #C49166;
   }}
 
-  /* ── Footer ── */
+  /* ── Footer halaman ── */
   .page-footer {{
     margin-top: 8px; font-size: 8px; color: #B8A78D;
     border-top: 0.5px solid #EDE0D0; padding-top: 4px;
@@ -1121,13 +1379,22 @@ def split_pdf_by_kurir(
 
             method_counts[method] += 1
 
-            parse_result = parse_produk(text)
+            parse_result     = parse_produk(text)
+            companion_result = parse_companion_produk(text)
+
+            # Kalau produk utama IS companion (e.g. resi Men Care murni),
+            # jangan double-count di companion_result
+            for main_key in list(parse_result.keys()):
+                base = re.sub(r"\s*\d+\s*PCS\s*$", "", main_key, flags=re.IGNORECASE).strip()
+                companion_result.pop(base, None)
+
             pages_info.append({
-                "idx":          i,
-                "kurir":        kurir,
-                "parse_result": parse_result,
-                "method":       method,
-                "is_multi_sku": _is_multi(parse_result),
+                "idx":              i,
+                "kurir":            kurir,
+                "parse_result":     parse_result,
+                "companion_result": companion_result,
+                "method":           method,
+                "is_multi_sku":     _is_multi(parse_result),
             })
 
     if progress_cb:
@@ -1143,6 +1410,7 @@ def split_pdf_by_kurir(
         "pages": [],
         "total_resi": 0,
         "total_per_produk": defaultdict(int),
+        "companion_per_produk": defaultdict(int),   # produk gratis tapi real
         "kurir": None,
         "produk": None,
     })
@@ -1181,6 +1449,10 @@ def split_pdf_by_kurir(
             g["total_per_produk"][nama] += qty
             prev = g["total_per_produk"].get(f"_BATANG_{nama}", 0)
             g["total_per_produk"][f"_BATANG_{nama}"] = prev + batang * qty
+
+        # Akumulasi companion (gratis tapi real product)
+        for nama, qty in p.get("companion_result", {}).items():
+            g["companion_per_produk"][nama] += qty
 
     if progress_cb:
         progress_cb(total_pages, total_pages, "Klasifikasi selesai.")
@@ -1640,10 +1912,12 @@ with tab_kloteran:
             is_m   = kl["is_multi"]
             tipe   = "Multi" if is_m else "Single"
             pq     = kl.get("produk_qty", {})
+            cq     = kl.get("companion_qty", {})
             pq_str = "  ·  ".join(f"{p}: {n} pcs" for p, n in pq.items())
+            cq_str = ("  +  " + "  ·  ".join(f"{p}: {n} pcs (gratis)" for p, n in cq.items())) if cq else ""
             st.markdown(
                 f"**Kloteran {kl['label']}** — {kl['kurir']} — {tipe} — "
                 f"{kl['jumlah_resi']} resi\n\n"
-                f"> {pq_str if pq_str else kl['produk_display']}"
+                f"> {pq_str if pq_str else kl['produk_display']}{cq_str}"
             )
             st.markdown("---")
