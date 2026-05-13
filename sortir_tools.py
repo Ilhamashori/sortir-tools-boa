@@ -597,6 +597,8 @@ def _parse_merchant_table(text_clean: str) -> tuple:
     if not merch_m:
         return None, None, None
     section = merch_m.group(1)
+    first_companion = None   # fallback: companion jadi primary kalau tidak ada produk lain
+
     for line in section.split("\n"):
         line = line.strip()
         if not line or re.search(r"qty\s+total", line, re.IGNORECASE):
@@ -609,7 +611,16 @@ def _parse_merchant_table(text_clean: str) -> tuple:
             sku = m.group(2).strip()
             if _is_ignore_sku(sku):
                 continue
+            # Companion SKU → skip untuk primary, simpan sebagai fallback
+            if sku.upper() in {k.upper() for k in _COMPANION_SKUS}:
+                if first_companion is None:
+                    first_companion = (m.group(1).strip(), sku, int(m.group(3)))
+                continue
             return m.group(1).strip(), sku, int(m.group(3))
+
+    # Tidak ada produk utama → pakai companion sebagai primary (e.g. resi Men Care murni)
+    if first_companion:
+        return first_companion
     return None, None, None
 
 
