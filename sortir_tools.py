@@ -291,6 +291,93 @@ def detect_kurir(text: str) -> str | None:
 
 
 # ══════════════════════════════════════════════════════════════
+#  TEXT EXTRACTION — pdfplumber + fitz fallback (anti-garble)
+# ══════════════════════════════════════════════════════════════
+#  Pdfplumber kadang garble teks di label SPX karena dua blok kolom
+#  overlap (mis. "Lip Serum" jadi "L0ip Serum"). Kalau hasil pdfplumber
+#  terdeteksi garble, fallback ke PyMuPDF (fitz) yang algoritmanya beda
+#  dan biasanya tidak garble di kasus yang sama.
+
+def _looks_garbled(text: str) -> bool:
+    """
+    Deteksi 3 pola garble pdfplumber yang berbeda:
+      1. Huruf-digit-huruf di tengah kata (e.g. 'L0ip', 'T1tle')
+         → pola "interleave kolom rapat" di SPX
+      2. Banyak baris ultra-pendek (≤3 char) berurutan
+         → pola "column overlap longgar" di SPX (karakter tersebar baris-baris)
+      3. Text terindikasi Shopee/SPX tapi tidak ada anchor 'Merchant Title'
+         atau '# Nama Produk' — berarti struktur tabelnya rusak
+    """
+    if not text:
+        return True
+
+    # Signal 1: digit di tengah kata
+    digit_in_word = len(re.findall(r"[A-Za-z]\d[A-Za-z]", text))
+    if digit_in_word >= 5:
+        return True
+
+    # Signal 2: terlalu banyak baris pendek (≤3 char trimmed)
+    lines = text.split("\n")
+    short_lines = sum(1 for ln in lines if 0 < len(ln.strip()) <= 3)
+    if short_lines >= 15:
+        return True
+
+    # Signal 3: text SPX (penanda 'SPXID') tapi struktur tabel hilang
+    # Pakai SPXID (bukan 'BEAUTY OF ANGEL' karena yg terakhir juga muncul
+    # di J&T/JNE sebagai pengirim → false positive)
+    if "SPXID" in text:
+        has_anchor = bool(re.search(
+            r"Merchant\s+Title|Nama\s+Produk", text, re.IGNORECASE,
+        ))
+        if not has_anchor:
+            return True
+
+    return False
+
+
+def _extract_text_fitz(pdf_bytes: bytes, page_index: int) -> str:
+    """Ekstraksi teks via PyMuPDF/fitz. Return '' kalau fitz tidak tersedia."""
+    try:
+        import fitz
+        doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
+        text = doc[page_index].get_text() or ""
+        doc.close()
+        return text
+    except Exception:
+        return ""
+
+
+def extract_page_text(
+    pdf_pl_page,
+    pdf_bytes: bytes,
+    page_index: int,
+) -> str:
+    """
+    Ekstraksi teks halaman dengan dual-extractor:
+    1. pdfplumber (default, format-aware)
+    2. fitz (fallback) — dipakai kalau pdfplumber hasilkan garble
+
+    Param:
+      pdf_pl_page : pdfplumber.Page (sudah dibuka di luar)
+      pdf_bytes   : bytes PDF asli (buat fitz)
+      page_index  : index halaman (0-based)
+    """
+    text_pl = pdf_pl_page.extract_text() or ""
+
+    if not _looks_garbled(text_pl):
+        return text_pl
+
+    # Hasil pdfplumber mencurigakan — coba fitz
+    text_fitz = _extract_text_fitz(pdf_bytes, page_index)
+    if text_fitz and not _looks_garbled(text_fitz):
+        return text_fitz
+
+    # Dua-duanya jelek — kembalikan pdfplumber yang lebih panjang
+    # (umumnya pdfplumber masih punya info posisi yang berguna)
+    return text_pl if len(text_pl) >= len(text_fitz) else text_fitz
+
+
+# ══════════════════════════════════════════════════════════════
 #  OCR FALLBACK
 # ══════════════════════════════════════════════════════════════
 
@@ -624,6 +711,85 @@ def _parse_merchant_table(text_clean: str) -> tuple:
     return None, None, None
 
 
+def _parse_nama_produk_table(text_clean: str) -> list[tuple[str, str, int]]:
+    """
+    Parse tabel atas '# Nama Produk SKU [Variasi] Qty' (format SPX/Shopee).
+    Return list of (title, sku, qty).
+
+    Dipakai sebagai fallback ketika tabel 'Merchant Title' di bawah
+    ke-garble pdfplumber karena overlap kolom (umum di label SPX).
+    Fix: BUG-SPX-PDFPLUMBER-GARBLE
+    """
+    m = re.search(
+        r"#\s*Nama\s*Produk\s*SKU\s*(?:Variasi)?\s*Qty(.+?)(?:Order\s*No|$)",
+        text_clean, re.DOTALL | re.IGNORECASE,
+    )
+    if not m:
+        return []
+    rows = []
+    for line in m.group(1).split("\n"):
+        line = line.strip()
+        if not line or _IGNORE_LINE_RE.search(line):
+            continue
+        # Format: "1 [...] Beauty of Angel - 0310AMLP 2"
+        row = re.match(
+            r"^\d+\s+(.+?)\s+([A-Z0-9]{6,}[-A-Z0-9]*)\s+(\d+)\s*$",
+            line,
+        )
+        if not row:
+            continue
+        title = row.group(1).strip()
+        sku   = row.group(2).strip()
+        qty   = int(row.group(3))
+        # Skip baris yang title-nya garbled fragment (minimal harus ada 3 huruf berurutan)
+        if not re.search(r"[A-Za-z]{3,}", title):
+            continue
+        rows.append((title, sku, qty))
+    return rows
+
+
+def _find_sku_anywhere(text: str) -> tuple[str, int] | None:
+    """
+    Cari SKU produk yang dikenali dari posisi MANA PUN di teks.
+    Tahan garble karena tidak bergantung struktur tabel.
+
+    Strategi: SKU (mis. '0310AMLP') punya format rapat & robust terhadap
+    interleave pdfplumber, jadi kalau ditemukan, kita pakai. Qty dicari
+    dari digit terdekat setelah SKU (dalam 20 char).
+
+    Return (sku, qty) atau None. Companion SKU dipakai cuma kalau
+    tidak ada primary SKU yang ketemu.
+    """
+    if not text:
+        return None
+
+    primary, companion = None, None
+    for m in re.finditer(r"\b([A-Z0-9]{6,}[-A-Z0-9]*)\b", text):
+        sku = m.group(1)
+        if _is_ignore_sku(sku):
+            continue
+        if not _sku_to_produk_name(sku):
+            continue
+
+        # Cari qty di 20 char setelah SKU
+        tail = text[m.end():m.end() + 20]
+        qty_m = re.search(r"\b(\d{1,2})\b", tail)
+        qty = int(qty_m.group(1)) if qty_m else 1
+        if not (1 <= qty <= 99):
+            qty = 1
+
+        if sku.upper() in {k.upper() for k in _COMPANION_SKUS}:
+            if companion is None:
+                companion = (sku, qty)
+            continue
+
+        if primary is None:
+            primary = (sku, qty)
+            break  # primary pertama menang
+
+    return primary or companion
+
+
 def _base_produk(sku_name: str) -> str:
     return re.sub(r"\s*\d+\s*PCS\s*$", "", sku_name, flags=re.IGNORECASE).strip()
 
@@ -633,7 +799,40 @@ def parse_produk(text: str) -> dict:
         return {}
 
     text_clean = re.sub(r"(?:Pengirim|Sender)\s*[:\(][^\n]*\n?", "", text, flags=re.IGNORECASE)
+
+    # ── STRATEGI 1: SKU-first (paling tahan garble) ──
+    # Cari SKU yang dikenali dari mana pun di teks. SKU lebih robust
+    # dibanding teks deskripsi karena format-nya rapat (digit+huruf).
+    sku_found = _find_sku_anywhere(text_clean)
+    if sku_found:
+        sku, qty = sku_found
+        nama = _sku_to_produk_name(sku)
+        if nama:
+            key = f"{nama} {qty} PCS" if qty > 1 else nama
+            return {key: 1}
+
+    # ── STRATEGI 2: Merchant table (existing) ──
     merch_title, table_sku, table_qty = _parse_merchant_table(text_clean)
+
+    # ── STRATEGI 3: Tabel atas '# Nama Produk SKU Variasi Qty' (SPX fallback) ──
+    # Fix: BUG-SPX-PDFPLUMBER-GARBLE — tabel merchant di bawah sering garble,
+    # tabel atas biasanya utuh.
+    if not table_sku:
+        rows = _parse_nama_produk_table(text_clean)
+        primary, companion = None, None
+        for title, sku, qty in rows:
+            if _is_ignore_sku(sku):
+                continue
+            if sku.upper() in {k.upper() for k in _COMPANION_SKUS}:
+                if companion is None:
+                    companion = (title, sku, qty)
+                continue
+            if primary is None:
+                primary = (title, sku, qty)
+                break
+        chosen = primary or companion
+        if chosen:
+            merch_title, table_sku, table_qty = chosen
 
     if table_sku:
         sku_produk = _sku_to_produk_name(table_sku)
@@ -642,6 +841,7 @@ def parse_produk(text: str) -> dict:
             key = f"{sku_produk} {qty} PCS" if qty > 1 else sku_produk
             return {key: 1}
 
+    # ── STRATEGI 4: Text pattern matching (last-resort fallback) ──
     # Buang baris free-gift sebelum text-scan
     search_text = _strip_ignore_lines(text_clean)
     if merch_title:
@@ -700,32 +900,67 @@ def parse_companion_produk(text: str) -> dict:
     Deteksi produk companion (free gift tapi real produk) dari teks resi.
     Return dict {nama_produk: total_qty}, terpisah dari produk utama.
     Tidak mempengaruhi grouping/sortir — hanya untuk rekap packing.
+
+    Strategi (urut dari paling spesifik ke paling tahan-banting):
+      1. Merchant table single-line  — format pdfplumber standar
+      2. Tabel atas '# Nama Produk'  — fallback SPX garbled
+      3. SKU-anywhere scan           — fallback fitz/per-cell-newline
+
+    Catatan tentang text Shopee yg di-obfuscate (e.g. "grtis rndom mencerahkan
+    melembabkan kulit"): kita TIDAK rely pada teks deskripsi — kita pakai SKU
+    sebagai anchor. SKU 0213AMCR tetap stabil walaupun Shopee ganti redaksi.
     """
     if not text:
         return {}
 
     text_clean = re.sub(r"(?:Pengirim|Sender)\s*[:\(][^\n]*\n?", "", text, flags=re.IGNORECASE)
+    hasil: dict[str, int] = {}
+    comp_upper = {k.upper(): v for k, v in _COMPANION_SKUS.items()}
+
+    # ── STRATEGI 1: Merchant table single-line (pdfplumber clean) ──
     merch_m = re.search(
         r"Merchant\s+Title\s+SKU\s+Qty(.+)",
         text_clean, re.DOTALL | re.IGNORECASE,
     )
-    if not merch_m:
-        return {}
+    if merch_m:
+        section = merch_m.group(1)
+        for line in section.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            m = re.search(r"^(.+?)\s+\b([A-Z0-9]{6,}[-A-Z0-9]*)\s+(\d+)\s*$", line)
+            if m:
+                sku = m.group(2).strip().upper()
+                if sku in comp_upper:
+                    nama = comp_upper[sku]
+                    hasil[nama] = hasil.get(nama, 0) + int(m.group(3))
+        if hasil:
+            return hasil
 
-    hasil: dict[str, int] = {}
-    section = merch_m.group(1)
-    comp_upper = {k.upper(): v for k, v in _COMPANION_SKUS.items()}
+    # ── STRATEGI 2: Tabel atas '# Nama Produk SKU Variasi Qty' ──
+    # Fix: BUG-SPX-PDFPLUMBER-GARBLE — merchant table di bawah sering garble.
+    for _title, sku, qty in _parse_nama_produk_table(text_clean):
+        if sku.upper() in comp_upper:
+            nama = comp_upper[sku.upper()]
+            hasil[nama] = hasil.get(nama, 0) + qty
+    if hasil:
+        return hasil
 
-    for line in section.split("\n"):
-        line = line.strip()
-        if not line:
+    # ── STRATEGI 3: SKU-anywhere scan (fitz multi-line, format apa saja) ──
+    # Fitz output meletakkan tiap cell di baris berbeda: "0213AMCR\n1\n".
+    # Kita scan SKU companion di mana pun, qty = digit terdekat setelahnya.
+    for m in re.finditer(r"\b([A-Z0-9]{6,}[-A-Z0-9]*)\b", text_clean):
+        sku = m.group(1).upper()
+        if sku not in comp_upper:
             continue
-        m = re.search(r"^(.+?)\s+\b([A-Z0-9]{6,}[-A-Z0-9]*)\s+(\d+)\s*$", line)
-        if m:
-            sku = m.group(2).strip().upper()
-            if sku in comp_upper:
-                nama = comp_upper[sku]
-                hasil[nama] = hasil.get(nama, 0) + int(m.group(3))
+        # qty: digit 1-2 dalam 20 char setelah SKU (skip whitespace/newline)
+        tail = text_clean[m.end():m.end() + 20]
+        qty_m = re.search(r"\s*(\d{1,2})\b", tail)
+        qty = int(qty_m.group(1)) if qty_m else 1
+        if not (1 <= qty <= 99):
+            qty = 1
+        nama = comp_upper[sku]
+        hasil[nama] = hasil.get(nama, 0) + qty
 
     return hasil
 
@@ -1431,7 +1666,9 @@ def split_pdf_by_kurir(
                 progress_cb(i, total_pages, f"Memproses halaman {i+1}/{total_pages}…")
 
             page = pdf_pl.pages[i]
-            text = page.extract_text() or ""
+            # Pakai extractor dual: pdfplumber → fitz kalau garbled
+            # Fix: BUG-SPX-PDFPLUMBER-GARBLE
+            text = extract_page_text(page, pdf_bytes, i)
 
             kurir  = detect_kurir(text)
             method = "text" if kurir else "none"
@@ -1788,6 +2025,40 @@ with tab_sortir:
                 "Total Batang": total_b,
             })
         st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+        # ── Warning: deteksi resi yang ter-fallback ke "BOA Produk" ──
+        # Fix: BUG-SPX-PDFPLUMBER-GARBLE — kasih alarm kalau parser kalah
+        # walau strategi SKU-first + fitz fallback sudah ada, supaya bug
+        # serupa di kurir/format baru bisa langsung ke-detect hari ini.
+        n_boa = 0
+        boa_groups = []
+        for name, d in groups.items():
+            if name.startswith("_"):
+                continue
+            produk = d.get("produk") or ""
+            if "BOA Produk" in produk:
+                n_boa += d.get("total_resi", 0)
+                boa_groups.append(name)
+            else:
+                # cek total_per_produk juga (kalau-kalau ada nyemplung)
+                for prod_key in d.get("total_per_produk", {}):
+                    if prod_key.startswith("_BATANG_"):
+                        continue
+                    if "BOA Produk" in prod_key:
+                        n_boa += d["total_per_produk"][prod_key]
+                        if name not in boa_groups:
+                            boa_groups.append(name)
+                        break
+
+        if n_boa > 0:
+            files_str = ", ".join(f"`{n}.pdf`" for n in boa_groups)
+            st.warning(
+                f"⚠️ **{n_boa} resi** ter-deteksi sebagai 'BOA Produk' — "
+                f"parser kemungkinan gagal baca produk spesifik. "
+                f"Cek manual di: {files_str}\n\n"
+                f"💡 Resi tetap masuk ZIP, hanya saja grouping-nya belum akurat. "
+                f"Kalau sering muncul, kirim PDF-nya buat update parser."
+            )
 
         with st.spinner("Menyusun PDF tersortir…"):
             output_pdfs = build_output_pdfs(pdf_bytes, groups)
