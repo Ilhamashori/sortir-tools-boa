@@ -263,7 +263,7 @@ KURIR_RULES = [
     {"kurir": "Anteraja", "patterns": [
         r"\banteraja\b", r"\bantar\s*aja\b", r"pakeko\s*aja",
         r"\bpakeko\b", r"\bPLBX?\d*\b", r"\bTSA-\d{6,}\b"], "priority": 9},
-    {"kurir": "GTL", "patterns": [r"\bgtl\b", r"goto\s*logistics"], "priority": 9},
+    {"kurir": "GTL", "patterns": [r"\bgtl\d+\b", r"\bgtl\b", r"goto\s*logistics"], "priority": 9},
     {"kurir": "Ninja Xpress", "patterns": [r"\bninja\s*xpress\b", r"\bninjaxpress\b", r"\blnid\d+\b"], "priority": 9},
     {"kurir": "Ninja LEX", "patterns": [r"\bninja\s*lex\b", r"\bnlex\b"], "priority": 10},
     {"kurir": "SAP", "patterns": [r"\bsap\s*express\b", r"\bsap\b"], "priority": 8},
@@ -1077,6 +1077,79 @@ _PRODUK_SINGKAT = {
 }
 
 
+# Kode SKU letter-only buat kartu print (compact, no digit)
+# None = render sebagai "( ... )" merah → admin tulis manual
+_PRODUK_KE_KODE_SKU: dict[str, str | None] = {
+    "Lip Serum":            "AMLP",
+    "Eye Cream":            "EYC",
+    "Eye Wrinkle":          "EWC",
+    "Glow Soap":            "GSR",
+    "Brightening Serum":    "BTS",
+    "Peeling Serum":        "APS",
+    "Moisturizer Serum":    "MOIS",
+    "Acne Serum":           "CCS",
+    "Body Lotion":          "BLT",
+    "Body Lotion Sachet":   "BLTS",
+    "Body Wash":            "BWC",
+    "Underarm":             "AUC",
+    "Feminine":             "FSP",
+    "Feminine Spray":       "FSP",
+    "Sunscreen":            "SSC",
+    "White Tomato Series":  "WT",
+    "Parfume":              "PRF",
+    "Parfume BYC":          "BYC",
+    "Toner":                "TNR",
+    "Facial Wash":          "FW",
+    "Day Cream":            "DC",
+    "Night Gel":            "NG",
+    "Collagen Drink":       "CDM",
+    "Cleansing Balm":       "CSB",
+    "Men Care":             "AMCR",
+    "Meili Beauty Cream":   "MEILI",
+    "BOA Produk":           None,   # fallback error → placeholder
+}
+
+
+def _split_qty_suffix(s: str) -> tuple[str, str | None]:
+    """
+    Pisahkan 'base produk' dari 'qty suffix'.
+    Handles: 'Lip Serum', 'Lip Serum 2pcs', 'Lip Serum 2 PCS', 'BL Sachet 4pcs'.
+    Returns (base, qty_str | None).
+    """
+    m = re.match(r"^(.+?)\s+(\d+)\s*pc[so]?\s*$", s, re.IGNORECASE)
+    if m:
+        return m.group(1).strip(), f"{m.group(2)}pcs"
+    return s.strip(), None
+
+
+def _kode_sku(nama: str) -> tuple[str, bool]:
+    """
+    Konversi nama produk (singkat atau full) ke kode SKU letter-only.
+    Examples:
+      'Lip Serum'      → ('AMLP', False)
+      'Lip Serum 2pcs' → ('AMLP 2pcs', False)
+      'BOA Produk'     → ('( ... )', True)   ← unknown flag = True
+      'Foo Bar'        → ('( ... )', True)   ← belum di-map
+    Returns (kode_string, is_unknown_flag).
+    """
+    base, qty_suffix = _split_qty_suffix(nama)
+
+    # Coba lookup di kode SKU mapping; kalau base sudah berupa "BL Sachet" dst
+    # (hasil _PRODUK_SINGKAT), reverse-map dulu ke nama kanonik.
+    kode = _PRODUK_KE_KODE_SKU.get(base)
+    if kode is None and base not in _PRODUK_KE_KODE_SKU:
+        # base mungkin nama singkat dari _PRODUK_SINGKAT → cari reverse
+        for kanonik, singkat in _PRODUK_SINGKAT.items():
+            if singkat == base:
+                kode = _PRODUK_KE_KODE_SKU.get(kanonik)
+                break
+
+    if kode is None:
+        return "( ... )", True
+
+    return (f"{kode} {qty_suffix}" if qty_suffix else kode), False
+
+
 def _singkat_produk(nama: str) -> str:
     """Ambil nama singkat produk. Strip PCS suffix dulu, lalu lookup."""
     base = re.sub(r"\s*\d+\s*PCS\s*$", "", nama, flags=re.IGNORECASE).strip()
@@ -1360,8 +1433,12 @@ def build_kloteran_excel(
 #  BUILD KLOTERAN PDF (Print Sheet)
 # ══════════════════════════════════════════════════════════════
 
-def _kartu_html(kl: dict, tgl_str: str, nama_toko: str = "BOA PST") -> str:
-    """Render 1 kartu kloteran sebagai HTML — siap digunting."""
+def _kartu_html(kl: dict, tgl_str: str, nama_toko: str = "BOA PST", is_copy: bool = False) -> str:
+    """
+    Render 1 kartu kloteran (original ATAU copy) sebagai HTML — siap digunting.
+    Pair (original + copy) di-wrap di build_kloteran_print_sheet supaya nempel
+    dengan dashed center divider.
+    """
     is_m     = kl["is_multi"]
     label    = kl["label"]
     kurir    = kl["kurir"]
@@ -1374,41 +1451,57 @@ def _kartu_html(kl: dict, tgl_str: str, nama_toko: str = "BOA PST") -> str:
         else '<span class="badge-single">SINGLE</span>'
     )
 
-    # Baris produk utama
+    # Baris produk utama — pakai kode SKU letter-only
     prod_rows = ""
+    has_unknown = False
     for p_short, total_p in produk_qty.items():
-        prod_rows += (
-            f'<div class="pr">'
-            f'<span class="pr-name">{p_short}</span>'
-            f'<span class="pr-qty">{total_p} pcs</span>'
-            f'</div>'
-        )
-    # Companion (gratis tapi real)
+        kode, is_unknown = _kode_sku(p_short)
+        if is_unknown:
+            has_unknown = True
+            prod_rows += (
+                f'<div class="pr pr-unknown">'
+                f'<span class="pr-name">{kode}</span>'
+                f'<span class="pr-qty">{total_p}</span>'
+                f'</div>'
+            )
+        else:
+            prod_rows += (
+                f'<div class="pr">'
+                f'<span class="pr-name">{kode}</span>'
+                f'<span class="pr-qty">{total_p}</span>'
+                f'</div>'
+            )
+    # Companion (free gift tapi real produk)
     for c_nama, c_total in companion_qty.items():
+        kode, _ = _kode_sku(c_nama)
         prod_rows += (
             f'<div class="pr">'
-            f'<span class="pr-name pr-free">{c_nama}*</span>'
-            f'<span class="pr-qty pr-free">{c_total} pcs</span>'
+            f'<span class="pr-name pr-free">{kode}*</span>'
+            f'<span class="pr-qty pr-free">{c_total}</span>'
             f'</div>'
         )
     if not prod_rows:
         prod_rows = '<div class="pr"><span class="pr-name">—</span></div>'
 
+    kartu_classes = "kartu"
+    if is_m:
+        kartu_classes += " kartu-multi"
+    if is_copy:
+        kartu_classes += " kartu-copy"
+
     return f"""
-<div class="kartu">
+<div class="{kartu_classes}">
   <div class="hdr">
     <div class="hdr-left">
       <span class="brand">{nama_toko}</span>
       <span class="knum">{label}</span>
     </div>
     <span class="tgl">{tgl_str}</span>
-    <div class="platform"><span>Shopee</span> / <span>TikTok</span></div>
   </div>
   <div class="core">
     <div class="left-big">
       <span class="jr-lbl">RESI</span>
       <span class="jr-num">{jml_resi}</span>
-      <div class="divider-hz"></div>
       <span class="ex-code">{kurir}</span>
       <span class="ex-lbl">KURIR</span>
     </div>
@@ -1428,13 +1521,23 @@ def build_kloteran_print_sheet(
     nama_toko: str = "BOA PST",
 ) -> tuple:
     """
-    Build print sheet grid kartu A4 — 2 kolom, semua kloteran 1 halaman.
-    Admin tinggal gunting per kartu, tempel ke tumpukan resi.
-    Returns (bytes, "pdf"|"html")
+    Build print sheet A4 dengan layout PAIR (original + copy attached).
+    Setiap kloteran di-render 2x: original + copy yang nempel dalam 1 border,
+    dipisahin dashed center divider buat panduan gunting.
+
+    Layout: 2 pair per row (= 4 kartu per row). Wrap otomatis ke row bawah.
+    Returns (bytes, "pdf"|"html").
     """
     tgl_str  = tanggal.strftime("%d/%m/%Y")
-    kartu_html_list = [_kartu_html(kl, tgl_str, nama_toko) for kl in kloterans]
-    kartu_joined    = "\n".join(kartu_html_list)
+
+    # Bangun pair HTML: original + copy attached
+    pair_html_list = []
+    for kl in kloterans:
+        original = _kartu_html(kl, tgl_str, nama_toko, is_copy=False)
+        copy     = _kartu_html(kl, tgl_str, nama_toko, is_copy=True)
+        pair_cls = "pair pair-multi" if kl["is_multi"] else "pair pair-single"
+        pair_html_list.append(f'<div class="{pair_cls}">{original}{copy}</div>')
+    pairs_joined = "\n".join(pair_html_list)
 
     total_resi   = sum(k["jumlah_resi"] for k in kloterans)
     total_single = sum(1 for k in kloterans if not k["is_multi"])
@@ -1461,7 +1564,7 @@ def build_kloteran_print_sheet(
   }}
   .page-header h1 {{ font-size: 13px; font-weight: 700; color: #15110D; }}
   .page-header .meta {{ font-size: 9px; color: #6B5D4D; text-align: right; line-height: 1.6; }}
-  .summary-chips {{ display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }}
+  .summary-chips {{ display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }}
   .chip {{
     background: #F5EFE6; border: 0.5px solid #C49166;
     border-radius: 999px; padding: 2px 9px;
@@ -1469,11 +1572,12 @@ def build_kloteran_print_sheet(
   }}
   .chip b {{ color: #A8744E; }}
 
-  /* ── Grid kartu ── */
-  .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }}
+  /* ── Grid pair ── 2 pair per row = 4 kartu per row. Wrap auto. */
+  .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }}
 
-  /* ── Kartu ── */
-  .kartu {{
+  /* ── Pair wrapper: outer border, 2 inner kartu attached ── */
+  .pair {{
+    display: flex;
     border: 1.5px solid #C49166;
     border-radius: 8px;
     overflow: hidden;
@@ -1481,79 +1585,121 @@ def build_kloteran_print_sheet(
     break-inside: avoid;
     page-break-inside: avoid;
   }}
+  .pair-multi {{ border-color: #C49166; }}
+  /* Dashed center divider sebagai panduan gunting */
+  .pair > .kartu + .kartu {{ border-left: 1.2px dashed #A8744E; }}
+  .pair-multi > .kartu + .kartu {{ border-left-color: #D4A574; }}
 
-  /* Header baris */
+  /* ── Kartu (inner) ── */
+  .kartu {{
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    background: #fff;
+  }}
+  .kartu-multi {{ background: #2E251E; color: #F0E4D2; }}
+
+  /* Header kartu */
   .hdr {{
     display: flex; justify-content: space-between; align-items: center;
-    padding: 4px 7px; gap: 5px;
+    padding: 3px 6px; gap: 4px;
     border-bottom: 0.5px solid #D4B896;
   }}
+  .kartu-multi .hdr {{ border-bottom-color: #5A4A3A; }}
   .hdr-left {{ display: flex; align-items: center; gap: 4px; flex-shrink: 0; }}
   .brand {{ font-size: 8px; font-weight: 700; color: #A8744E; letter-spacing: .3px; }}
+  .kartu-multi .brand {{ color: #D4A574; }}
   .knum {{
-    font-size: 11px; font-weight: 700; color: #15110D;
+    font-size: 13px; font-weight: 700; color: #15110D;
     background: #F5EFE6; border: 0.5px solid #D4B896;
-    border-radius: 3px; padding: 0 5px; line-height: 1.5;
+    border-radius: 3px; padding: 1px 7px; line-height: 1.3;
   }}
-  .tgl {{ font-size: 8px; color: #6B5D4D; white-space: nowrap; }}
-  .platform {{ font-size: 8px; color: #B8A78D; white-space: nowrap; }}
-  .platform span {{
-    padding: 0 4px; border: 0.5px solid #D4B896; border-radius: 3px;
+  .kartu-multi .knum {{
+    background: #C49166; color: #15110D; border-color: #C49166;
   }}
+  .tgl {{ font-size: 7px; color: #6B5D4D; white-space: nowrap; }}
+  .kartu-multi .tgl {{ color: #D4A574; }}
 
-  /* Core: kiri besar + kanan produk */
-  .core {{ display: flex; border-bottom: 0.5px solid #D4B896; }}
+  /* Core: kiri (RESI+KURIR) + kanan (produk list) */
+  .core {{ display: flex; flex: 1; border-bottom: 0.5px solid #D4B896; }}
+  .kartu-multi .core {{ border-bottom-color: #5A4A3A; }}
 
   .left-big {{
-    width: 58px; min-width: 58px;
+    width: 52px; min-width: 52px;
     display: flex; flex-direction: column;
     align-items: center; justify-content: center;
-    padding: 8px 0;
+    padding: 4px 0;
     border-right: 0.5px solid #D4B896;
-    gap: 0;
+    gap: 1px;
   }}
-  .jr-lbl {{ font-size: 7px; color: #B8A78D; letter-spacing: .4px; margin-bottom: 1px; }}
-  .jr-num {{ font-size: 36px; font-weight: 700; color: #15110D; line-height: 1; }}
-  .divider-hz {{ width: 38px; height: 1px; background: #C49166; margin: 4px 0; }}
-  .ex-code {{ font-size: 18px; font-weight: 700; color: #15110D; line-height: 1; }}
-  .ex-lbl {{ font-size: 7px; color: #B8A78D; letter-spacing: .4px; margin-top: 2px; }}
+  .kartu-multi .left-big {{ border-right-color: #5A4A3A; }}
+  .jr-lbl {{ font-size: 7px; color: #B8A78D; letter-spacing: .4px; }}
+  .kartu-multi .jr-lbl {{ color: #D4A574; }}
+  .jr-num {{ font-size: 30px; font-weight: 700; color: #15110D; line-height: 1; }}
+  .kartu-multi .jr-num {{ color: #F0E4D2; }}
+  .ex-code {{ font-size: 17px; font-weight: 700; color: #15110D; line-height: 1; margin-top: 3px; }}
+  .kartu-multi .ex-code {{ color: #F0E4D2; }}
+  .ex-lbl {{ font-size: 7px; color: #B8A78D; letter-spacing: .4px; }}
+  .kartu-multi .ex-lbl {{ color: #D4A574; }}
 
-  .produk-list {{ flex: 1; padding: 5px 7px; display: flex; flex-direction: column; gap: 3px; }}
+  .produk-list {{
+    flex: 1;
+    padding: 4px 7px;
+    display: flex; flex-direction: column;
+    justify-content: center;
+    gap: 1px;
+  }}
   .pr {{
     display: flex; justify-content: space-between; align-items: baseline;
-    border-bottom: 0.5px dotted #EDE0D0; padding-bottom: 2px;
+    border-bottom: 0.5px dotted #EDE0D0; padding: 2px 0;
   }}
-  .pr:last-child {{ border-bottom: none; padding-bottom: 0; }}
-  .pr-name {{ font-size: 9px; color: #15110D; max-width: 85px; line-height: 1.3; }}
-  .pr-name.pr-free {{ color: #8A7A66; font-style: italic; }}
-  .pr-qty {{ font-size: 10px; font-weight: 700; color: #15110D; white-space: nowrap; }}
-  .pr-qty.pr-free {{ color: #8A7A66; font-weight: 400; }}
+  .kartu-multi .pr {{ border-bottom-color: #4A3A2A; }}
+  .pr:last-child {{ border-bottom: none; }}
+  .pr-name {{
+    font-size: 16px; font-weight: 700; color: #15110D;
+    line-height: 1.2; letter-spacing: .3px;
+  }}
+  .kartu-multi .pr-name {{ color: #F0E4D2; }}
+  .pr-name.pr-free {{ color: #8A7A66; font-weight: 500; font-style: italic; font-size: 14px; }}
+  .kartu-multi .pr-name.pr-free {{ color: #D4A574; }}
+  .pr-qty {{ font-size: 16px; font-weight: 700; color: #15110D; white-space: nowrap; }}
+  .kartu-multi .pr-qty {{ color: #F0E4D2; }}
+  .pr-qty.pr-free {{ color: #8A7A66; font-weight: 500; font-size: 14px; }}
+  .kartu-multi .pr-qty.pr-free {{ color: #D4A574; }}
+
+  /* Unknown produk fallback — merah supaya admin tahu tulis manual */
+  .pr-unknown .pr-name, .pr-unknown .pr-qty {{
+    color: #C0392B !important;
+    font-weight: 700;
+  }}
 
   /* Footer */
   .footer {{
     display: flex; justify-content: space-between; align-items: center;
-    padding: 4px 7px;
+    padding: 3px 6px;
   }}
-  .paraf {{ font-size: 8px; color: #B8A78D; }}
+  .paraf {{ font-size: 7px; color: #B8A78D; }}
+  .kartu-multi .paraf {{ color: #D4A574; }}
   .paraf-line {{
-    display: inline-block; width: 60px; height: 0.5px;
+    display: inline-block; width: 40px; height: 0.5px;
     background: #C49166; vertical-align: middle; margin-left: 3px;
   }}
   .badge-multi {{
-    font-size: 7px; font-weight: 700;
-    padding: 1px 5px; border-radius: 3px;
+    font-size: 6px; font-weight: 700;
+    padding: 1px 4px; border-radius: 3px;
     background: #C49166; color: #15110D;
   }}
   .badge-single {{
-    font-size: 7px; font-weight: 700;
-    padding: 1px 5px; border-radius: 3px;
+    font-size: 6px; font-weight: 700;
+    padding: 1px 4px; border-radius: 3px;
     background: #F5EFE6; color: #A8744E;
     border: 0.5px solid #C49166;
   }}
 
   /* ── Footer halaman ── */
   .page-footer {{
-    margin-top: 8px; font-size: 8px; color: #B8A78D;
+    margin-top: 10px; font-size: 8px; color: #B8A78D;
     border-top: 0.5px solid #EDE0D0; padding-top: 4px;
     display: flex; justify-content: space-between;
   }}
@@ -1577,15 +1723,16 @@ def build_kloteran_print_sheet(
   <div class="chip">Total Resi <b>{total_resi}</b></div>
   <div class="chip">Single <b>{total_single}</b></div>
   <div class="chip">Multi <b>{total_multi}</b></div>
+  <div class="chip">Kartu (×2 copy) <b>{len(kloterans) * 2}</b></div>
 </div>
 
 <div class="grid">
-{kartu_joined}
+{pairs_joined}
 </div>
 
 <div class="page-footer">
-  <span>BOA Sortir Tools v1.2 — Crafted by Mashori</span>
-  <span>Dokumen internal — potong per kotak, tempel ke tumpukan resi</span>
+  <span>BOA Sortir Tools v1.3 — Crafted by Mashori</span>
+  <span>Tiap kotak digunting di garis putus-putus tengah. Pair = original + copy.</span>
 </div>
 
 </body>
@@ -1936,15 +2083,16 @@ tab_sortir, tab_kloteran = st.tabs(["📤 Sortir Resi", "📋 Kloteran"])
 with tab_sortir:
     st.markdown("#### 📤 Upload PDF Resi")
     st.caption(
-        "Upload **1 file PDF** berisi label resi campuran dari berbagai ekspedisi. "
-        "Tools akan memisahnya menjadi PDF per kurir, lalu di-bundle ke 1 file ZIP."
+        "Upload **1 atau lebih file PDF** berisi label resi campuran dari berbagai ekspedisi. "
+        "Multi-file akan otomatis di-gabung dulu sebelum di-sortir, lalu di-bundle ke 1 file ZIP."
     )
 
-    uploaded = st.file_uploader(
+    uploaded_files = st.file_uploader(
         "Pilih file PDF",
         type=["pdf"],
         key="sortir_upload",
         label_visibility="collapsed",
+        accept_multiple_files=True,
     )
 
     _GROQ_KEY_AVAILABLE = bool(_get_groq_api_key())
@@ -1959,20 +2107,40 @@ with tab_sortir:
     with col_o3:
         use_groq = st.checkbox(
             "🤖 Groq Vision",
-            value=_GROQ_KEY_AVAILABLE,
+            value=False,  # default OFF — user harus opt-in manual
             disabled=not _GROQ_KEY_AVAILABLE,
             key="opt_groq",
             help=(
-                "Layer 3: Groq Vision (Llama 4 Scout)."
+                "Layer 3: Groq Vision (Llama 4 Scout). Centang manual kalau perlu."
                 if _GROQ_KEY_AVAILABLE else
                 "Disabled — GROQ_API_KEY tidak ditemukan."
             ),
         )
 
-    if uploaded is None:
-        st.info("⬆️ Upload PDF resi dulu untuk memulai.")
+    if not uploaded_files:
+        st.info("⬆️ Upload PDF resi dulu untuk memulai. Bisa drag-drop banyak file sekaligus.")
     elif st.button("🚀 Mulai Sortir", type="primary", use_container_width=True, key="btn_run"):
-        pdf_bytes = uploaded.read()
+        # ── Multi-PDF support: gabung jadi 1 PDF dulu sebelum proses ──
+        from pypdf import PdfReader, PdfWriter
+        if len(uploaded_files) == 1:
+            pdf_bytes = uploaded_files[0].read()
+            file_info = f"`{uploaded_files[0].name}`"
+        else:
+            writer = PdfWriter()
+            file_names = []
+            for f in uploaded_files:
+                try:
+                    reader = PdfReader(io.BytesIO(f.read()))
+                    for p in reader.pages:
+                        writer.add_page(p)
+                    file_names.append(f.name)
+                except Exception as e:
+                    st.warning(f"⚠️ Gagal baca `{f.name}` — di-skip ({e})")
+            buf = io.BytesIO()
+            writer.write(buf)
+            pdf_bytes = buf.getvalue()
+            file_info = f"**{len(file_names)} file** di-gabung: " + ", ".join(f"`{n}`" for n in file_names)
+        st.caption(f"📦 Input: {file_info}")
 
         progress_bar = st.progress(0.0)
         status_text  = st.empty()
@@ -2012,11 +2180,15 @@ with tab_sortir:
 
         st.markdown("#### 📊 Ringkasan Hasil Sortir")
         rows = []
+        total_resi_all = 0
+        total_batang_all = 0
         for name in sorted(groups.keys()):
             d       = groups[name]
             kurir   = d.get("kurir") or "—"
             produk  = d.get("produk") or "Mixed"
             total_b = sum(v for k, v in d["total_per_produk"].items() if k.startswith("_BATANG_"))
+            total_resi_all += d["total_resi"]
+            total_batang_all += total_b
             rows.append({
                 "File PDF": f"{name}.pdf",
                 "Kurir": kurir,
@@ -2025,6 +2197,15 @@ with tab_sortir:
                 "Total Batang": total_b,
             })
         st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+        # ── Total counter (FIX: tampilkan total semua resi & batang) ──
+        col_t1, col_t2, col_t3 = st.columns(3)
+        with col_t1:
+            st.metric("📦 Total Resi", f"{total_resi_all:,}")
+        with col_t2:
+            st.metric("🔢 Total Batang", f"{total_batang_all:,}")
+        with col_t3:
+            st.metric("📁 Total Grup", len(rows))
 
         # ── Warning: deteksi resi yang ter-fallback ke "BOA Produk" ──
         # Fix: BUG-SPX-PDFPLUMBER-GARBLE — kasih alarm kalau parser kalah
