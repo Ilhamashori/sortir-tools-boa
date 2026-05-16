@@ -254,6 +254,10 @@ KURIR_RULES = [
         r"\bsicepat\b", r"\bsi\s*cepat\b", r"\bsicep[a-z/]{0,3}t?\b",
         r"\bhalu\s*5\b", r"\bhalu\s*ribu\b", r"halu.{0,3}5.{0,3}ribu",
         r"\bribu\b", r"\b0046\d{8}\b"], "priority": 9},
+    {"kurir": "LEX", "patterns": [
+        r"\blxad[-\d]+\b",       # barcode Lazada: LXAD-5111643986
+        r"lazada\s*express",     # teks eksplisit
+    ], "priority": 10},
     {"kurir": "JNT LEX", "patterns": [r"\bjnt\s*lex\b", r"\bJNTLEX\d+\b"], "priority": 10},
     {"kurir": "J&T", "patterns": [
         r"\bj\s*&\s*t\b", r"\bjnt\s*express\b", r"\bjnt\b",
@@ -264,12 +268,20 @@ KURIR_RULES = [
         r"\banteraja\b", r"\bantar\s*aja\b", r"pakeko\s*aja",
         r"\bpakeko\b", r"\bPLBX?\d*\b", r"\bTSA-\d{6,}\b"], "priority": 9},
     {"kurir": "GTL", "patterns": [r"\bgtl\d+\b", r"\bgtl\b", r"goto\s*logistics"], "priority": 9},
-    {"kurir": "Ninja Xpress", "patterns": [r"\bninja\s*xpress\b", r"\bninjaxpress\b", r"\blnid\d+\b"], "priority": 9},
+    {"kurir": "Ninja Xpress", "patterns": [
+        r"\bninja\s*xpress\b", r"\bninjaxpress\b", r"\blnid\d+\b",
+        r"\bninja\s*van\b",    # label Tokopedia tulis "ninjavan"
+        r"\bninjavan\b",
+        r"\bnjvtt\d+\b",       # barcode Ninja Van Tokopedia: NJVTT06248465592
+    ], "priority": 9},
     {"kurir": "Ninja LEX", "patterns": [r"\bninja\s*lex\b", r"\bnlex\b"], "priority": 10},
     {"kurir": "SAP", "patterns": [r"\bsap\s*express\b", r"\bsap\b"], "priority": 8},
     {"kurir": "SAP LEX", "patterns": [r"\bsap\s*lex\b"], "priority": 10},
     {"kurir": "Ninja Pusat", "patterns": [r"\bninja\s*pusat\b", r"\bninjapusat\b"], "priority": 10},
-    {"kurir": "ID Express", "patterns": [r"\bid\s*express\b", r"\bidexpress\b", r"\bidexp\b"], "priority": 9},
+    {"kurir": "ID Express", "patterns": [
+        r"\bid\s*express\b", r"\bidexpress\b", r"\bidexp\b",
+        r"\btkp\d{8,}\b",      # barcode ID Express Tokopedia: TKP8022978348
+    ], "priority": 9},
     {"kurir": "Pos Indonesia", "patterns": [r"\bpos\s*indonesia\b", r"\bpt\s*pos\b", r"\bpos\b"], "priority": 8},
     {"kurir": "Lion Parcel", "patterns": [r"\blion\s*parcel\b", r"\blionparcel\b", r"\blion\b"], "priority": 8},
     {"kurir": "Instan", "patterns": [r"\binstan\b", r"\bsameday\b", r"\bsame\s*day\b", r"\binstant\b"], "priority": 9},
@@ -278,6 +290,19 @@ KURIR_RULES = [
 
 KURIR_LIST             = [r["kurir"] for r in KURIR_RULES]
 KURIR_BELUM_TERDETEKSI = "Belum-Terdeteksi"
+
+
+def _extract_order_id(text: str) -> str | None:
+    """
+    Extract Order ID dari teks resi berbagai platform.
+    - Lazada/Tokopedia : 'Order ID : 2690286349404790' atau 'Order ID：584039...'
+    - Shopee           : 'Order No: 260515G1VYKBGT'
+    """
+    m = re.search(
+        r"Order\s*(?:ID|No)[：:]\s*([A-Z0-9]{8,})",
+        text, re.IGNORECASE,
+    )
+    return m.group(1).strip() if m else None
 
 
 def detect_kurir(text: str) -> str | None:
@@ -1804,8 +1829,9 @@ def split_pdf_by_kurir(
     reader      = PdfReader(io.BytesIO(pdf_bytes))
     total_pages = len(reader.pages)
 
-    method_counts = defaultdict(int)
-    pages_info    = []
+    method_counts     = defaultdict(int)
+    pages_info        = []
+    _seen_order_ids: set[str] = set()   # dedup: simpan Order ID yang sudah diproses
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf_pl:
         for i in range(total_pages):
@@ -1816,6 +1842,14 @@ def split_pdf_by_kurir(
             # Pakai extractor dual: pdfplumber → fitz kalau garbled
             # Fix: BUG-SPX-PDFPLUMBER-GARBLE
             text = extract_page_text(page, pdf_bytes, i)
+
+            # ── Dedup: skip halaman kalau Order ID sudah pernah muncul ──
+            order_id = _extract_order_id(text)
+            if order_id:
+                if order_id in _seen_order_ids:
+                    method_counts["duplicate"] += 1
+                    continue   # resi duplikat → lewati, pakai yang pertama
+                _seen_order_ids.add(order_id)
 
             kurir  = detect_kurir(text)
             method = "text" if kurir else "none"
@@ -2174,9 +2208,16 @@ with tab_sortir:
 
         mc     = meta.get("method_counts", {})
         labels = {"text": "📄 Text", "ocr": "🔍 OCR", "groq": "🤖 Groq", "none": "❓ Tidak terdeteksi"}
-        parts  = [f"{labels.get(m, m)}: **{n}**" for m, n in mc.items() if n > 0]
+        parts  = [f"{labels.get(m, m)}: **{n}**" for m, n in mc.items() if m != "duplicate" and n > 0]
         if parts:
             st.caption("Metode deteksi: " + " · ".join(parts))
+
+        n_dup = mc.get("duplicate", 0)
+        if n_dup > 0:
+            st.warning(
+                f"⚠️ **{n_dup} resi duplikat** ditemukan dan dilewati — "
+                f"Order ID yang sama hanya diproses 1x (halaman pertama yang dipakai)."
+            )
 
         st.markdown("#### 📊 Ringkasan Hasil Sortir")
         rows = []
